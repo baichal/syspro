@@ -21,6 +21,13 @@ warn() {
     echo -e "${YELLOW}[WARNING] $1${NC}"
 }
 
+# 清屏函数
+clear_screen() {
+    clear
+    echo -e "${GREEN}syspro - Linux服务器优化脚本${NC}"
+    echo -e "${YELLOW}==============================${NC}"
+}
+
 # 检查是否已经优化
 check_optimized() {
     if [ -f "/etc/syspro_optimized" ]; then
@@ -140,17 +147,17 @@ set_time_sync() {
 
 # 安装其他变种 BBR
 install_other_bbr_variants() {
-	echo -e "${NFTX_YELLOW}正在安装其他变种 BBR...${NFTX_PLAIN}"
-	echo -e "${NFTX_YELLOW}这将运行来自 https://git.io/kernel.sh 的脚本${NFTX_PLAIN}"
-	echo -e "${NFTX_RED}警告：运行来自网络的脚本可能存在安全风险。请确保您信任该脚本。${NFTX_PLAIN}"
-	echo -n -e "${NFTX_YELLOW}是否继续？(y/n): ${NFTX_PLAIN}"
-	read confirm
+    echo -e "${YELLOW}正在安装其他变种 BBR...${NC}"
+    echo -e "${YELLOW}这将运行来自 https://git.io/kernel.sh 的脚本${NC}"
+    echo -e "${RED}警告：运行来自网络的脚本可能存在安全风险。请确保您信任该脚本。${NC}"
+    echo -n -e "${YELLOW}是否继续？(y/n): ${NC}"
+    read confirm
 
-	if [[ $confirm == [Yy] ]]; then
-		bash <(curl -Lso- https://git.io/kernel.sh)
-	else
-		echo -e "${NFTX_YELLOW}已取消安装${NFTX_PLAIN}"
-	fi
+    if [[ $confirm == [Yy] ]]; then
+        bash <(curl -Lso- https://git.io/kernel.sh)
+    else
+        echo -e "${YELLOW}已取消安装${NC}"
+    fi
 }
 
 disable_system_logs() {
@@ -281,35 +288,29 @@ EOF
 # 手动优化部分
 manual_optimize() {
     while true; do
-        echo -e "\n${YELLOW}手动优化选项:${NC}"
-        echo "1. 配置硬件加速"
-        echo "2. 返回主菜单"
-
-        read -p "请选择要执行的操作 (1-2): " choice
-
-        case $choice in
-            1) configure_hardware_acceleration ;;
-            2) return ;;
-            *) error "无效选项，请重新选择" ;;
-        esac
-    done
-}
-
-# 手动优化部分
-manual_optimize() {
-    while true; do
-        echo -e "\n${YELLOW}手动优化选项:${NC}"
+        clear_screen
+        echo "手动优化选项:"
         echo "1. 卸载旧内核"
-		echo "2. 安装其他变种 BBR"
+        echo "2. 安装其他变种 BBR"
         echo "3. 返回主菜单"
+        echo
 
-        read -p "请选择要执行的操作 (1-2): " choice
+        read -p "请选择要执行的操作 (1-3): " choice
 
         case $choice in
-            1) uninstall_kernels ;;
-			3) install_other_bbr_variants ;;
-            2) return ;;
-            *) error "无效选项，请重新选择" ;;
+            1) 
+                uninstall_kernels
+                read -p "按回车键继续..."
+                ;;
+            2) 
+                install_other_bbr_variants
+                read -p "按回车键继续..."
+                ;;
+            3) return ;;
+            *) 
+                error "无效选项，请重新选择"
+                read -p "按回车键继续..."
+                ;;
         esac
     done
 }
@@ -356,9 +357,32 @@ uninstall_kernels() {
             else
                 info "正在卸载内核: $kernel_to_remove"
                 if command -v apt &> /dev/null; then
-                    apt remove -y "$kernel_to_remove"
+                    # 尝试卸载内核包
+                    if apt purge -y "$kernel_to_remove"; then
+                        info "成功卸载内核包: $kernel_to_remove"
+                    else
+                        warn "卸载内核包失败: $kernel_to_remove"
+                    fi
+
+                    # 尝试卸载头文件包
+                    headers_package="linux-headers-${kernel_to_remove#linux-image-}"
+                    if apt purge -y "$headers_package"; then
+                        info "成功卸载头文件包: $headers_package"
+                    else
+                        warn "卸载头文件包失败或不存在: $headers_package"
+                    fi
+
+                    # 清理相关文件
+                    rm -f "/boot/initrd.img-${kernel_to_remove#linux-image-}"
+                    rm -rf "/lib/modules/${kernel_to_remove#linux-image-}"
                 elif command -v yum &> /dev/null; then
-                    yum remove -y "$kernel_to_remove"
+                    if yum remove -y "$kernel_to_remove"; then
+                        info "成功卸载内核: $kernel_to_remove"
+                    else
+                        warn "卸载内核失败: $kernel_to_remove"
+                    fi
+                    rm -f "/boot/initramfs-${kernel_to_remove#kernel-}.img"
+                    rm -rf "/lib/modules/${kernel_to_remove#kernel-}"
                 fi
             fi
         else
@@ -366,27 +390,48 @@ uninstall_kernels() {
         fi
     done
 
-    info "内核卸载完成"
+    info "正在更新GRUB配置..."
+    if command -v update-grub &> /dev/null; then
+        update-grub
+    elif command -v grub2-mkconfig &> /dev/null; then
+        grub2-mkconfig -o /boot/grub2/grub.cfg
+    else
+        warn "无法自动更新GRUB配置,请手动更新"
+    fi
+
+    info "内核卸载过程完成"
+    echo "请检查上述输出，确保所有步骤都成功执行。"
+    echo "如果有任何警告或错误，可能需要手动处理。"
 }
 
 # 主菜单
 main_menu() {
     while true; do
-        echo -e "\n${GREEN}syspro - Linux服务器优化脚本${NC}"
+        clear_screen
         echo "1. 自动优化（包含禁用日志）"
         echo "2. 手动优化"
         echo "3. 退出"
+        echo
 
         read -p "请选择操作 (1-3): " option
 
         case $option in
-            1) auto_optimize ;;
-            2) manual_optimize ;;
+            1) 
+                auto_optimize
+                read -p "按回车键继续..."
+                ;;
+            2) 
+                manual_optimize
+                ;;
             3) 
+                clear_screen
                 info "退出脚本"
                 exit 0 
                 ;;
-            *) error "无效选项，请重新选择" ;;
+            *) 
+                error "无效选项，请重新选择"
+                read -p "按回车键继续..."
+                ;;
         esac
     done
 }
@@ -398,4 +443,5 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 # 运行主菜单
+clear_screen
 main_menu
