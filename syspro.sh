@@ -253,36 +253,57 @@ security_hardening() {
 
 configure_dns() {
     info "配置DNS..."
-    if grep -q "nameserver 76.76.2.0" /etc/resolv.conf; then
-        info "DNS已经配置过"
-    else
-        # 安装resolvconf
-        install_package resolvconf
+    
+    # 禁用systemd-resolved（Ubuntu/Debian）
+    if systemctl is-active systemd-resolved &> /dev/null; then
+        systemctl stop systemd-resolved
+        systemctl disable systemd-resolved
+        rm -f /etc/resolv.conf
+        touch /etc/resolv.conf
+    fi
 
-        if ! command -v resolvconf &> /dev/null; then
-            warn "无法安装resolvconf，跳过DNS配置"
-            return
-        fi
+    # 安装resolvconf
+    install_package resolvconf || {
+        error "resolvconf安装失败"
+        return 1
+    }
 
-        # 配置DNS服务器
-        cat > /etc/resolvconf/resolv.conf.d/head << EOF
+    # 确保服务运行
+    systemctl enable --now resolvconf 2> /dev/null
+
+    # 生成配置文件
+    local dns_conf="/etc/resolvconf/resolv.conf.d/head"
+    cat > "$dns_conf" << EOF
 nameserver 76.76.10.0
 nameserver 8.8.8.8
 EOF
 
-        # 检查是否启用了IPv6
-        if ip -6 addr | grep -q "inet6"; then
-            cat >> /etc/resolvconf/resolv.conf.d/head << EOF
+    # IPv6检测
+    if ip -6 addr | grep -q "inet6"; then
+        cat >> "$dns_conf" << EOF
 nameserver 2606:1a40::
 nameserver 2606:4700:4700::1111
 EOF
-        fi
-
-        # 更新resolv.conf
-        sudo resolvconf -u
-
-        info "DNS配置完成"
     fi
+
+    # 三重更新保障
+    for _ in {1..3}; do
+        resolvconf -u 2> /dev/null
+        sleep 1
+    done
+
+    # 文件保护
+    chattr -i /etc/resolv.conf 2> /dev/null
+    chattr +i /etc/resolv.conf 2> /dev/null
+
+    # 最终验证
+    if ! grep -q "76.76.10.0" /etc/resolv.conf; then
+        error "DNS配置失败，尝试强制写入..."
+        echo "nameserver 76.76.10.0" > /etc/resolv.conf
+        echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+    fi
+
+    info "DNS配置完成"
 }
 
 # 手动优化部分
