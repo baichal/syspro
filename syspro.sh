@@ -279,7 +279,7 @@ EOF
         fi
 
         # 更新resolv.conf
-        resolvconf -u
+        sudo resolvconf -u
 
         info "DNS配置完成"
     fi
