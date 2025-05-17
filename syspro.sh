@@ -266,8 +266,8 @@ configure_dns() {
 
         # 配置DNS服务器
         cat > /etc/resolvconf/resolv.conf.d/head << EOF
-nameserver 76.76.2.0
-nameserver 1.1.1.1
+nameserver 76.76.10.0
+nameserver 8.8.8.8
 EOF
 
         # 检查是否启用了IPv6
