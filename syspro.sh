@@ -264,9 +264,8 @@ optimize_memory() {
 
     # --- 3.4 [增强版] ZRAM 内存压缩 ---
     HAS_ZRAM=0
-    # 检测逻辑：模块存在且能加载
+    # 增加检测：不仅要模块存在，还要能加载
     if modinfo zram >/dev/null 2>&1 && modprobe zram num_devices=1 >/dev/null 2>&1; then
-        # 只有当 zram 没有被挂载时才配置
         if ! grep -q "zram" /proc/swaps; then
             log_info "内核支持 ZRAM，正在配置内存压缩..."
             
@@ -277,26 +276,34 @@ optimize_memory() {
                 ZRAM_SIZE=2048
             fi
             
-            # 算法选择: 优先 zstd > lzo
+            # 算法选择
             ALGO="lzo"
             if [ -f /sys/block/zram0/comp_algorithm ]; then
                 if grep -q zstd /sys/block/zram0/comp_algorithm; then ALGO="zstd"; fi
             fi
 
-            # 生成启动脚本
+            # [关键修改] 生成更稳健的启动脚本
             cat > /usr/local/bin/zram-start.sh <<EOF
 #!/bin/bash
+# 1. 加载模块
 modprobe zram num_devices=1
 sleep 1
-if [ -f /sys/block/zram0/reset ]; then echo 1 > /sys/block/zram0/reset 2>/dev/null; fi
+
+# 2. 如果设备已被初始化过，先重置 (防止报错 Device or resource busy)
+if [ -f /sys/block/zram0/reset ]; then
+    echo 1 > /sys/block/zram0/reset 2>/dev/null
+fi
+
+# 3. 设置参数
 echo "$ALGO" > /sys/block/zram0/comp_algorithm 2>/dev/null
 echo "${ZRAM_SIZE}M" > /sys/block/zram0/disksize
+
+# 4. 启用 Swap
 mkswap /sys/block/zram0
 swapon -p 100 /sys/block/zram0
 EOF
             chmod +x /usr/local/bin/zram-start.sh
             
-            # Systemd 服务
             cat > /etc/systemd/system/zram.service <<EOF
 [Unit]
 Description=SysPro ZRAM Swap
@@ -311,7 +318,8 @@ EOF
             systemctl daemon-reload
             systemctl enable zram --now >/dev/null 2>&1
             
-            sleep 2
+            # 验证
+            sleep 2 # 给一点时间让 Service 启动
             if grep -q "zram" /proc/swaps; then
                 log_success "ZRAM 已启用 (大小: ${ZRAM_SIZE}MB, 算法: ${ALGO})。"
                 HAS_ZRAM=1
@@ -326,42 +334,35 @@ EOF
         log_warn "当前内核不支持 ZRAM，跳过。"
     fi
     
-    # --- 3.5 磁盘 Swap (智能识别) ---
+    # --- 3.5 磁盘 Swap (awk 精确识别版) ---
     SWAP_TOTAL=$(free -m | awk '/Swap:/ {print $2}')
     
-    # 检查当前 Swap 构成
-    HAS_FILE_SWAP=0
-    HAS_PARTITION_SWAP=0
-    
-    if grep -q "/swapfile" /proc/swaps; then HAS_FILE_SWAP=1; fi
-    # 检查是否有非 zram 且非 file 的 swap (即物理分区)
-    if grep -v "zram" /proc/swaps | grep -v "Filename" | grep -v "/swapfile" | grep -q "/dev/"; then
-        HAS_PARTITION_SWAP=1
-    fi
+    # 使用 awk 读取 /proc/swaps 的第二列 (Type)
+    # 忽略表头，查找是否有 partition 或 file
+    HAS_PARTITION_SWAP=$(awk 'NR>1 {if ($2 == "partition") print "yes"}' /proc/swaps | head -n1)
+    HAS_FILE_SWAP=$(awk 'NR>1 {if ($2 == "file") print "yes"}' /proc/swaps | head -n1)
 
     # 逻辑判断
     if [ "$SWAP_TOTAL" -ge 100 ]; then
-        if [ "$HAS_FILE_SWAP" -eq 1 ]; then
-            log_info "检测到已存在文件 Swap (/swapfile)，跳过创建。"
-        elif [ "$HAS_PARTITION_SWAP" -eq 1 ]; then
-            # 这里的关键点：明确告诉用户这是系统自带的
-            log_info "检测到 VPS 预分配的物理 Swap 分区，无需创建文件 Swap。"
+        if [ "$HAS_FILE_SWAP" == "yes" ]; then
+            log_info "检测到已存在文件型 Swap (Type: file)，跳过创建。"
+        elif [ "$HAS_PARTITION_SWAP" == "yes" ]; then
+            log_info "检测到 VPS 预分配的物理 Swap 分区 (Type: partition)，无需创建文件 Swap。"
         else
+            # 可能是 ZRAM 撑起来的空间
             log_info "Swap 空间充足 ($SWAP_TOTAL MB)，无需额外操作。"
         fi
         return
     fi
     
-    # 如果 Swap 不足，开始创建 /swapfile
+    # 创建 /swapfile
     log_warn "系统 Swap 空间不足，正在创建磁盘 Swap (/swapfile)..."
     
-    # 确定大小
     if [ "$HAS_ZRAM" -eq 1 ]; then SIZE=1024; else
         MEM_TOTAL=$(free -m | awk '/Mem:/ {print $2}')
         if [ "$MEM_TOTAL" -le 2048 ]; then SIZE=2048; else SIZE=1024; fi
     fi
     
-    # 磁盘空间检查
     DISK_AVAIL=$(df -m / | awk 'NR==2 {print $4}')
     if [ "$DISK_AVAIL" -lt "$((SIZE + 500))" ]; then
         log_err "磁盘空间不足，无法创建文件 Swap。"
@@ -856,17 +857,17 @@ uninstall_syspro() {
     rm -f /etc/systemd/system/zram.service
     rm -f /usr/local/bin/zram-start.sh
     
-    # 3. 清理 OOM 保护
+    # 3. 清理 OOM / Shell / Cron
     rm -f /usr/local/bin/oom-protect.sh
     crontab -l 2>/dev/null | grep -v "oom-protect" | crontab -
-    
-    # 4. 清理 Shell 配置
+
+    # 4. 清理 Shell 配置 (新)
     rm -f /etc/profile.d/syspro_shell.sh
-    
-    # 5. 清理 Fstrim 任务
+
+    # 5. 清理 Fstrim 任务 (新)
     rm -f /etc/cron.weekly/fstrim
     
-    # 6. 清理 DoH 服务
+    # 4. 清理 DoH
     if systemctl is-active syspro-doh >/dev/null 2>&1; then
         systemctl stop syspro-doh
         systemctl disable syspro-doh
@@ -874,54 +875,52 @@ uninstall_syspro() {
     rm -f /etc/systemd/system/syspro-doh.service
     rm -f /usr/local/bin/cloudflared
     
-    # 7. 还原 DNS
+    # 5. 还原 DNS
     rm -f /etc/resolv.conf
     echo "nameserver 1.1.1.1" > /etc/resolv.conf
     echo "nameserver 8.8.8.8" >> /etc/resolv.conf
     
-    # 8. [核心优化] 安全清理 Swap
+    # 6. [核心修正] 安全清理 Swap
     log_info "正在清理 Swap 配置..."
     
-    # 检测是否存在文件型 Swap
+    # A. 无论是否挂载，只要文件存在，即视为脚本创建的目标
     if [ -f "/swapfile" ]; then
-        # 检查它是否正在被使用
-        if grep -q "/swapfile" /proc/swaps; then
-            log_info "发现脚本创建的 Swap (/swapfile)，正在卸载..."
-            swapoff /swapfile
-        else
-            log_info "发现残留文件 /swapfile (未挂载)，准备删除..."
-        fi
-        
+        # 尝试卸载 (忽略错误，以防未挂载)
+        swapoff /swapfile >/dev/null 2>&1
         # 删除文件
         rm -f /swapfile
-        
-        # 清理 Fstab 中的记录
-        if grep -q "/swapfile" /etc/fstab; then
-            sed -i '/\/swapfile/d' /etc/fstab
-            log_success "已移除 /swapfile 配置及文件。"
-        fi
+        log_success "已移除脚本创建的 /swapfile 文件。"
     else
-        log_info "未检测到脚本创建的 /swapfile，跳过清理。"
+        log_info "未检测到 /swapfile 文件，跳过删除。"
+    fi
+
+    # B. 清理当前 fstab
+    if grep -q "/swapfile" /etc/fstab; then
+        sed -i '/^\/swapfile/d' /etc/fstab
     fi
     
-    # 提示物理分区状态 (仅提示，不操作)
-    if grep -v "zram" /proc/swaps | grep -v "Filename" | grep -v "/swapfile" | grep -q "/dev/"; then
+    # C. 还原 fstab 备份 (如果存在)
+    if [ -f /etc/fstab.syspro.bak ]; then
+        mv /etc/fstab.syspro.bak /etc/fstab
+        # [关键步骤] 即使还原了备份，也要再次确保备份里没有 swapfile
+        # 防止用户多次运行脚本，导致备份文件里已经包含了 swapfile
+        sed -i '/^\/swapfile/d' /etc/fstab
+        systemctl daemon-reload && mount -o remount /
+        log_info "已还原 /etc/fstab 备份。"
+    fi
+
+    # D. 最终状态检查 (只提示物理分区)
+    # 使用 awk 精确检查是否还有 Type 为 partition 的设备
+    HAS_PARTITION=$(awk 'NR>1 {if ($2 == "partition") print "yes"}' /proc/swaps | head -n1)
+    if [ "$HAS_PARTITION" == "yes" ]; then
         log_info "检测到系统预分配的物理 Swap 分区 (Partition)，已安全保留。"
     fi
 
-    # 9. 还原 fstab 其他部分
-    if [ -f /etc/fstab.syspro.bak ]; then
-        # 即使还原，也要确保没有 swapfile 记录
-        mv /etc/fstab.syspro.bak /etc/fstab 
-        sed -i '/\/swapfile/d' /etc/fstab
-        systemctl daemon-reload && mount -o remount /
-    fi
-
-    # 10. 还原 Udev
+    # 7. 还原其他组件
     rm -f /etc/udev/rules.d/60-io-scheduler.rules
     [ -n "$(command -v udevadm)" ] && udevadm control --reload && udevadm trigger
     
-    # 11. 还原 SSH
+    # 还原 SSH
     if [ -f /etc/ssh/sshd_config.syspro.bak ]; then
         mv /etc/ssh/sshd_config.syspro.bak /etc/ssh/sshd_config
         if sshd -t; then 
@@ -929,16 +928,16 @@ uninstall_syspro() {
         fi
     fi
     
-    # 12. 还原 Systemd
+    # 还原 Systemd
     [ -f /etc/systemd/system.conf.syspro.bak ] && mv /etc/systemd/system.conf.syspro.bak /etc/systemd/system.conf
     systemctl daemon-reload
     
-    # 13. 还原 Sysctl
+    # 还原 Sysctl
     rm -f /etc/sysctl.d/98-syspro-security.conf
     rm -f /etc/security/limits.d/99-disable-core.conf
     sysctl --system >/dev/null 2>&1
 
-    echo -e "${GREEN}卸载完成！脚本组件已清理，预分配 Swap 已保留。${PLAIN}"
+    echo -e "${GREEN}卸载完成！系统已恢复默认状态。${PLAIN}"
 }
 
 # ==============================================================================
