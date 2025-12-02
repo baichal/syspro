@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # ==============================================================================
-#   SysPro v5.3 - Linux Deep Infrastructure Optimizer (ARM 增强全量版)
+#   SysPro Linux Deep Infrastructure Optimizer (ARM 增强全量版)
 #   (Foundation Layer | DoH Support | Safe Operations | ARM Ready)
 # ==============================================================================
 #
