@@ -83,60 +83,68 @@ log_info "系统环境: ${GREEN}${RELEASE}${PLAIN} | 架构: ${GREEN}${ARCH}${PL
 #   模块 1: 磁盘 I/O 深度调优 (Disk I/O)
 # ==============================================================================
 optimize_disk_io() {
-    log_info "正在优化磁盘 I/O 策略..."
+    log_info "正在优化磁盘 I/O 策略与存储健康..."
     
-    # --- 1.1 挂载参数优化 (noatime) [修复版] ---
-    # 原理: 默认 atime 会在每次读取文件时产生写入操作，noatime 可大幅减少元数据写入。
-    
-    # 1. 备份 fstab
+    # --- 1.1 挂载参数优化 (noatime) ---
+    # 减少文件访问时间写入，降低 I/O 延迟
     [ ! -f /etc/fstab.syspro.bak ] && cp /etc/fstab /etc/fstab.syspro.bak
     
-    # 2. 检查是否已经存在 noatime
     if grep -q " / " /etc/fstab && grep -E " / .*noatime" /etc/fstab >/dev/null 2>&1; then
         log_info "根分区已配置 noatime，跳过修改。"
     else
         log_info "尝试修改 /etc/fstab 添加 noatime..."
+        # 精确匹配根分区并添加参数
+        awk '$2 == "/" && ($3 == "ext4" || $3 == "xfs" || $3 == "btrfs") { $4 = $4",noatime,nodiratime" } 1' /etc/fstab > /etc/fstab.tmp
         
-        # 使用 awk 精确查找根分区行并修改
-        awk '$2 == "/" && ($3 == "ext4" || $3 == "xfs") { $4 = $4",noatime,nodiratime" } 1' /etc/fstab > /etc/fstab.tmp
-        
-        # 覆盖前校验文件是否有变化
         if cmp -s /etc/fstab /etc/fstab.tmp; then
-            log_warn "未能在 fstab 中定位到标准的根分区配置(ext4/xfs)，跳过修改。"
             rm -f /etc/fstab.tmp
+            log_warn "未检测到标准根分区格式，跳过 fstab 修改。"
         else
             mv /etc/fstab.tmp /etc/fstab
-            
-            # [关键修复] 立即验证配置有效性
+            # 立即测试挂载，失败则回滚
             if mount -o remount / 2>/dev/null; then
-                log_success "根分区挂载参数已更新并在线生效。"
+                log_success "根分区挂载参数已更新 (noatime)。"
             else
-                log_err "警告：修改 fstab 后挂载测试失败！正在回滚以防重启失败..."
+                log_err "挂载测试失败！自动回滚 fstab..."
                 cp /etc/fstab.syspro.bak /etc/fstab
-                log_warn "已自动恢复 /etc/fstab 原文件。"
             fi
         fi
     fi
 
-    # --- 1.2 I/O 调度器优化 (基于 udev) [ARM 增强版] ---
-    # 原理: NVMe 无需调度，SSD 使用 mq-deadline，机械盘使用 bfq
-    # ARM新增: SD卡/eMMC (mmcblk) 使用 mq-deadline 减少卡顿
+    # --- 1.2 I/O 调度器优化 (Udev 规则) ---
+    # 针对 NVMe, SSD, HDD, SD卡(MMC) 设置不同的调度算法
     if command -v udevadm >/dev/null 2>&1; then
         cat > /etc/udev/rules.d/60-io-scheduler.rules << EOF
-# NVMe: 设置为 none (直接旁路，减少延迟)
 ACTION=="add|change", KERNEL=="nvme[0-9]*n[0-9]*", ATTR{queue/scheduler}="none"
-# SSD/VirtIO (非旋转): 设置为 mq-deadline
 ACTION=="add|change", KERNEL=="sd[a-z]*|vd[a-z]*", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline"
-# HDD (旋转): 设置为 bfq
 ACTION=="add|change", KERNEL=="sd[a-z]*", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="bfq"
-# [ARM] MMC/SD Card (Raspberry Pi/SBC): mq-deadline
 ACTION=="add|change", KERNEL=="mmcblk[0-9]*", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline"
 EOF
-        # 重载规则并触发
         udevadm control --reload && udevadm trigger
-        log_success "I/O 调度器规则已配置 (包含 MMC/SD卡 优化)。"
+        log_success "I/O 调度器规则已更新 (含 MMC/SD 卡优化)。"
     else
-        log_warn "系统未安装 udevadm，跳过调度器优化。"
+        log_warn "未找到 udevadm，跳过调度器优化。"
+    fi
+
+    # --- 1.3 [新增] 存储健康维护 (Fstrim) ---
+    # 只有存在 fstrim 命令且由 systemd 管理时才启用
+    if command -v fstrim >/dev/null 2>&1; then
+        log_info "正在配置 Flash 存储 TRIM 自动清理..."
+        # 优先使用 Systemd Timer
+        if [ -d /usr/lib/systemd/system ] || [ -d /etc/systemd/system ]; then
+            # 某些精简系统可能没有 fstrim.timer 文件，我们需要先确认
+            if systemctl list-unit-files --all | grep -q "fstrim.timer"; then
+                systemctl enable fstrim.timer --now >/dev/null 2>&1
+                log_success "fstrim.timer 已启用 (Systemd 托管)。"
+            else
+                # 如果没有 timer 文件，创建 cron 任务作为保底
+                if [ ! -f /etc/cron.weekly/fstrim ]; then
+                    echo -e "#!/bin/sh\nfstrim -av" > /etc/cron.weekly/fstrim
+                    chmod +x /etc/cron.weekly/fstrim
+                    log_success "已创建 fstrim 周常任务 (/etc/cron.weekly)。"
+                fi
+            fi
+        fi
     fi
 }
 
@@ -209,84 +217,164 @@ optimize_compute() {
 #   模块 3: 系统进程与内存 (Systemd & Swap)
 # ==============================================================================
 optimize_systemd() {
-    log_info "优化 Systemd 全局配置..."
+    log_info "优化 Systemd 全局配置与进程保护..."
     
-    # 备份配置
+    # --- 3.1 Systemd 超时优化 ---
     [ ! -f /etc/systemd/system.conf.syspro.bak ] && cp /etc/systemd/system.conf /etc/systemd/system.conf.syspro.bak
-    
-    # --- 3.1 缩短服务停止超时 (90s -> 10s) ---
-    # 解决关机/重启时长时间等待问题
     sed -i 's/^#DefaultTimeoutStopSec=.*/DefaultTimeoutStopSec=10s/' /etc/systemd/system.conf
     sed -i 's/^DefaultTimeoutStopSec=.*/DefaultTimeoutStopSec=10s/' /etc/systemd/system.conf
-    
     systemctl daemon-reload
-    log_success "服务超时时间已缩短至 10s。"
     
     # --- 3.2 禁用 Core Dump ---
-    # 节省空间并提高安全性
     echo "* hard core 0" > /etc/security/limits.d/99-disable-core.conf
-    echo "* soft core 0" >> /etc/security/limits.d/99-disable-core.conf
+    
+    # --- 3.3 [新增] OOM 关键进程豁免 (防失联) ---
+    log_info "正在部署 OOM Killer 豁免策略 (SSH/Systemd)..."
+    
+    # 创建保护脚本
+    cat > /usr/local/bin/oom-protect.sh << 'EOF'
+#!/bin/bash
+# 核心原理: 设置 oom_score_adj 为 -1000 (禁止被杀)
+# 1. 保护 Systemd (PID 1)
+echo -1000 > /proc/1/oom_score_adj 2>/dev/null
+# 2. 保护 Journald (日志)
+pgrep -f "systemd-journald" | while read pid; do echo -500 > /proc/$pid/oom_score_adj 2>/dev/null; done
+# 3. 保护 SSHD (主进程及当前连接)
+if [ -f /var/run/sshd.pid ]; then 
+    echo -1000 > /proc/$(cat /var/run/sshd.pid)/oom_score_adj 2>/dev/null
+fi
+pgrep -f "/usr/sbin/sshd" | while read pid; do 
+    echo -1000 > /proc/$pid/oom_score_adj 2>/dev/null
+done
+EOF
+    chmod +x /usr/local/bin/oom-protect.sh
+    
+    # 注册到 Crontab (@reboot) 以确保持久化
+    if ! crontab -l 2>/dev/null | grep -q "oom-protect"; then
+        (crontab -l 2>/dev/null; echo "@reboot /usr/local/bin/oom-protect.sh") | crontab -
+    fi
+    
+    # 立即执行一次
+    /usr/local/bin/oom-protect.sh
+    log_success "关键进程保护已生效 (SSH OOM Score = -1000)。"
 }
 
 optimize_memory() {
-    log_info "检查 Swap 分区状态..."
+    log_info "正在优化内存结构 (ZRAM & Swap)..."
+
+    # --- 3.4 [增强版] ZRAM 内存压缩 ---
+    HAS_ZRAM=0
+    # 增加检测：不仅要模块存在，还要能加载
+    if modinfo zram >/dev/null 2>&1 && modprobe zram num_devices=1 >/dev/null 2>&1; then
+        if ! grep -q "zram" /proc/swaps; then
+            log_info "内核支持 ZRAM，正在配置内存压缩..."
+            
+            MEM_TOTAL_MB=$(free -m | awk '/Mem:/ {print $2}')
+            if [ "$MEM_TOTAL_MB" -le 2048 ]; then 
+                ZRAM_SIZE=$(($MEM_TOTAL_MB / 2))
+            else 
+                ZRAM_SIZE=2048
+            fi
+            
+            # 算法选择
+            ALGO="lzo"
+            if [ -f /sys/block/zram0/comp_algorithm ]; then
+                if grep -q zstd /sys/block/zram0/comp_algorithm; then ALGO="zstd"; fi
+            fi
+
+            # [关键修改] 生成更稳健的启动脚本
+            cat > /usr/local/bin/zram-start.sh <<EOF
+#!/bin/bash
+# 1. 加载模块
+modprobe zram num_devices=1
+sleep 1
+
+# 2. 如果设备已被初始化过，先重置 (防止报错 Device or resource busy)
+if [ -f /sys/block/zram0/reset ]; then
+    echo 1 > /sys/block/zram0/reset 2>/dev/null
+fi
+
+# 3. 设置参数
+echo "$ALGO" > /sys/block/zram0/comp_algorithm 2>/dev/null
+echo "${ZRAM_SIZE}M" > /sys/block/zram0/disksize
+
+# 4. 启用 Swap
+mkswap /sys/block/zram0
+swapon -p 100 /sys/block/zram0
+EOF
+            chmod +x /usr/local/bin/zram-start.sh
+            
+            cat > /etc/systemd/system/zram.service <<EOF
+[Unit]
+Description=SysPro ZRAM Swap
+After=multi-user.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/zram-start.sh
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+            systemctl daemon-reload
+            systemctl enable zram --now >/dev/null 2>&1
+            
+            # 验证
+            sleep 2 # 给一点时间让 Service 启动
+            if grep -q "zram" /proc/swaps; then
+                log_success "ZRAM 已启用 (大小: ${ZRAM_SIZE}MB, 算法: ${ALGO})。"
+                HAS_ZRAM=1
+            else
+                log_err "ZRAM 启动失败 (可能是 KVM 限制)，将回退到普通 Swap。"
+            fi
+        else
+            log_info "ZRAM 已经处于启用状态。"
+            HAS_ZRAM=1
+        fi
+    else
+        log_warn "当前内核不支持 ZRAM，跳过。"
+    fi
     
+    # --- 3.5 磁盘 Swap (兜底/扩展) ---
     SWAP_TOTAL=$(free -m | awk '/Swap:/ {print $2}')
     
-    if [ "$SWAP_TOTAL" -eq 0 ]; then
-        log_warn "未检测到 Swap，正在创建以防止内存溢出..."
+    # [修改] 如果 ZRAM 失败(HAS_ZRAM=0)，且当前 Swap < 100M，才创建磁盘 Swap
+    # 如果 ZRAM 成功了，通常不需要再创建磁盘 Swap，除非为了休眠
+    if [ "$SWAP_TOTAL" -lt 100 ]; then
+        log_warn "系统 Swap 空间不足，正在创建磁盘 Swap..."
         
-        # 计算大小: 内存<=2G则2G Swap，否则1G Swap
-        MEM_TOTAL=$(free -m | awk '/Mem:/ {print $2}')
-        if [ "$MEM_TOTAL" -le 2048 ]; then SIZE=2048; else SIZE=1024; fi
+        if [ "$HAS_ZRAM" -eq 1 ]; then
+            SIZE=1024
+        else
+            MEM_TOTAL=$(free -m | awk '/Mem:/ {print $2}')
+            if [ "$MEM_TOTAL" -le 2048 ]; then SIZE=2048; else SIZE=1024; fi
+        fi
         
-        # [ARM 新增] 检查磁盘剩余空间 (防止 SD 卡撑爆)
         DISK_AVAIL=$(df -m / | awk 'NR==2 {print $4}')
         if [ "$DISK_AVAIL" -lt "$((SIZE + 500))" ]; then
-            log_err "磁盘空间不足 (剩余 ${DISK_AVAIL}MB)，无法安全创建 ${SIZE}MB Swap，跳过。"
+            log_err "磁盘空间不足，无法创建文件 Swap。"
             return
         fi
 
-        log_info "计划创建 ${SIZE}MB Swap 文件..."
-        
-        # --- 改进点: Btrfs 兼容性检查 ---
-        # 如果是 Btrfs，Swap 文件必须禁用 CoW (Copy-on-Write)
-        
-        # 1. 清理旧残留
-        rm -f /swapfile
-        touch /swapfile
-        
-        # 2. 检查文件系统类型
+        rm -f /swapfile && touch /swapfile
         FS_TYPE=$(df -T /swapfile | tail -1 | awk '{print $2}')
         if [ "$FS_TYPE" == "btrfs" ]; then
-            log_warn "检测到 Btrfs 文件系统，正在禁用 Swap 文件的 CoW 属性..."
-            if command -v chattr >/dev/null; then
-                chattr +C /swapfile
-            else
-                log_err "缺少 chattr 命令，无法安全在 Btrfs 上创建 Swap，跳过。"
-                rm -f /swapfile
-                return
-            fi
+            if command -v chattr >/dev/null; then chattr +C /swapfile; fi
         fi
         
-        # 3. 使用 fallocate 快速预分配 (秒级)
         if ! fallocate -l ${SIZE}M /swapfile 2>/dev/null; then
-            log_warn "fallocate 分配失败，回退到 dd 模式 (较慢)..."
             dd if=/dev/zero of=/swapfile bs=1M count=$SIZE status=none
         fi
         
-        # 4. 权限设置与启用
         chmod 600 /swapfile
         mkswap /swapfile
         swapon /swapfile
         
-        # 5. 持久化
         if ! grep -q "/swapfile" /etc/fstab; then 
             echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
         fi
-        log_success "Swap 创建成功并已启用。"
+        log_success "磁盘 Swap (${SIZE}MB) 已创建并启用。"
     else
-        log_info "系统已存在 Swap ($SWAP_TOTAL MB)，无需操作。"
+        log_info "Swap 空间充足 ($SWAP_TOTAL MB)，无需额外操作。"
     fi
 }
 
@@ -405,67 +493,84 @@ EOF
 }
 
 optimize_access() {
-    log_info "正在优化接入层 (SSH & DNS)..."
+    log_info "正在优化接入层 (SSH & Environment)..."
 
-    # --- 5.1 SSH 优化 (带安全回滚) ---
-    log_info "优化 SSH 配置 (禁用 DNS 反查/GSSAPI)..."
+    # --- 5.1 SSH 优化 (带回滚) ---
     SSHD_CONF="/etc/ssh/sshd_config"
     [ ! -f ${SSHD_CONF}.syspro.bak ] && cp $SSHD_CONF ${SSHD_CONF}.syspro.bak
     
+    # 仅修改必要项
     sed -i 's/^#UseDNS.*/UseDNS no/' $SSHD_CONF
     sed -i 's/^UseDNS.*/UseDNS no/' $SSHD_CONF
     sed -i 's/^#GSSAPIAuthentication.*/GSSAPIAuthentication no/' $SSHD_CONF
     sed -i 's/^GSSAPIAuthentication.*/GSSAPIAuthentication no/' $SSHD_CONF
     
-    # 重启前强制检查配置
-    log_info "正在校验 SSH 配置完整性..."
+    # 校验并重启
     if sshd -t; then
         if [[ "${RELEASE}" == "centos" ]]; then systemctl restart sshd; else systemctl restart ssh; fi
-        log_success "SSH 配置校验通过并已重启。"
+        log_success "SSH 配置优化完成 (已禁用 DNS反查)。"
     else
-        log_err "SSH 配置校验失败！为了防止失联，已自动还原备份。"
+        log_err "SSH 配置校验失败，已自动回滚。"
         cp ${SSHD_CONF}.syspro.bak $SSHD_CONF
-        log_warn "请手动检查 /etc/ssh/sshd_config 文件错误。"
     fi
 
-    # --- 5.2 DNS 配置 (交互式) ---
+    # --- 5.2 [新增] Shell 交互体验优化 ---
+    log_info "配置 Shell 历史记录与提示符..."
+    # 写入 profile.d 以便对所有用户生效
+    cat > /etc/profile.d/syspro_shell.sh << 'EOF'
+# SysPro Shell Optimization
+# 1. 增加历史记录容量
+export HISTSIZE=10000
+export HISTFILESIZE=20000
+# 2. 忽略重复命令
+export HISTCONTROL=ignoreboth
+# 3. 增加时间戳 (年-月-日 时:分:秒)
+export HISTTIMEFORMAT="%F %T "
+# 4. 防止多窗口覆盖历史记录
+shopt -s histappend
+export PROMPT_COMMAND="history -a; history -c; history -r; $PROMPT_COMMAND"
+# 5. Root 用户提示符标红 (警示作用)
+if [ "$EUID" -eq 0 ]; then
+    PS1='\[\e[1;31m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
+fi
+EOF
+    log_success "Shell 环境配置已生成 (/etc/profile.d/syspro_shell.sh)。"
+
+    # --- 5.3 DNS 配置 ---
     echo -e "${YELLOW}请选择 DNS 模式:${PLAIN}"
     echo -e " 1. ${GREEN}标准 UDP DNS${PLAIN} (速度快, 1.1.1.1/8.8.8.8)"
-    echo -e " 2. ${GREEN}DoH 加密 DNS${PLAIN} (防劫持, 支持 ARM64/ARM32)"
+    echo -e " 2. ${GREEN}DoH 加密 DNS${PLAIN} (防劫持, 支持 ARM)"
     read -p "请输入选项 [1-2] (默认1): " DNS_CHOICE
     
-    # 先解锁文件
+    # 1. 解锁并准备文件
     chattr -i /etc/resolv.conf >/dev/null 2>&1
     
-    # 清理旧 DoH 服务
+    # 2. 如果存在旧的 DoH 服务，先停止，防止冲突
     if [ -f /etc/systemd/system/syspro-doh.service ]; then
         systemctl stop syspro-doh
         systemctl disable syspro-doh
     fi
 
+    # 3. 处理 DoH 选项
     if [[ "$DNS_CHOICE" == "2" ]]; then
         if install_cloudflared; then
             rm -f /etc/resolv.conf
             echo "# SysPro DoH (Cloudflared)" > /etc/resolv.conf
-            # 主 DNS 指向本地
             echo "nameserver 127.0.0.1" >> /etc/resolv.conf
-            
-            # [关键修复] 添加备用公共 DNS，防止 Cloudflared 挂掉导致断网
-            echo "# Fallback DNS (Backup)" >> /etc/resolv.conf
+            # 添加备用 DNS 防止 Cloudflared 挂掉断网
+            echo "# Fallback DNS" >> /etc/resolv.conf
             echo "nameserver 1.1.1.1" >> /etc/resolv.conf
-            echo "nameserver 8.8.8.8" >> /etc/resolv.conf
-            
-            # 缩短超时时间，加快故障切换
             echo "options timeout:1 attempts:1" >> /etc/resolv.conf
             
             chattr +i /etc/resolv.conf
-            log_success "DoH 模式已生效 (Resolv.conf 已锁定，包含备用 DNS)。"
+            log_success "DoH 模式已生效 (Resolv.conf 已锁定)。"
         else
-            log_warn "DoH 安装失败，回退到标准模式。"
+            log_warn "DoH 安装失败，自动回退到标准 UDP 模式。"
             DNS_CHOICE="1"
         fi
     fi
 
+    # 4. 处理标准 DNS 选项 (或回退)
     if [[ "$DNS_CHOICE" != "2" ]]; then
         rm -f /etc/resolv.conf
         echo "# SysPro Standard DNS" > /etc/resolv.conf
@@ -495,41 +600,78 @@ optimize_access() {
 maintenance_tasks() {
     log_info "执行系统维护任务..."
     
-    # 基础工具
+    # --- 6.1 基础工具与时间同步 ---
     TOOLS="curl wget vim nano htop iotop net-tools ca-certificates unzip"
-    log_info "安装运维工具 ($TOOLS)..."
     
     if [[ "${RELEASE}" == "centos" ]]; then
-        yum install -y epel-release && yum install -y $TOOLS
-        systemctl enable chronyd --now 2>/dev/null || systemctl enable chrony --now 2>/dev/null
+        yum install -y epel-release
+        yum install -y $TOOLS chrony
+        SVC_CHRONY="chronyd"
     else
-        apt-get update && apt-get install -y $TOOLS
-        systemctl enable chrony --now 2>/dev/null
+        apt-get update
+        apt-get install -y $TOOLS chrony
+        SVC_CHRONY="chrony"
     fi
     
-    # 交互式时区设置
-    CURRENT_TZ=$(timedatectl show --property=Timezone --value 2>/dev/null)
-    echo -e "${YELLOW}当前时区: ${CURRENT_TZ:-Unknown}${PLAIN}"
-    # 这里为了自动化体验，如果用户不干预，可考虑自动跳过，但这里保持原版交互
-    timedatectl set-timezone Asia/Shanghai
-    log_success "时区已更新为 Asia/Shanghai (默认)。"
+    # 优化 Chrony 配置 (激进同步)
+    CFG_CHRONY="/etc/chrony/chrony.conf"
+    [ ! -f "$CFG_CHRONY" ] && CFG_CHRONY="/etc/chrony.conf"
+    
+    if [ -f "$CFG_CHRONY" ]; then
+        if ! grep -q "^makestep" "$CFG_CHRONY"; then
+            echo "makestep 1.0 3" >> "$CFG_CHRONY"
+        fi
+        systemctl enable $SVC_CHRONY --now >/dev/null 2>&1
+        systemctl restart $SVC_CHRONY
+        log_success "时间同步服务已优化 (Chrony + Makestep)。"
+    fi
+    
+    # --- 6.2 [修正] 时区设置 (交互式) ---
+    CURRENT_TZ=$(timedatectl show --property=Timezone --value 2>/dev/null || cat /etc/timezone)
+    echo -e "\n${YELLOW}当前时区: ${GREEN}${CURRENT_TZ:-Unknown}${PLAIN}"
+    echo -e "请选择目标时区:"
+    echo -e " 1. ${GREEN}Asia/Shanghai${PLAIN}       (北京时间 UTC+8)"
+    echo -e " 2. ${GREEN}Asia/Hong_Kong${PLAIN}      (香港时间 UTC+8)"
+    echo -e " 3. ${GREEN}Asia/Tokyo${PLAIN}          (东京时间 UTC+9)"
+    echo -e " 4. ${GREEN}America/Los_Angeles${PLAIN}   (美西时间 UTC-7/8)"
+    echo -e " 5. ${GREEN}America/New_York${PLAIN}      (美东时间 UTC-4/5)"
+    echo -e " 6. ${GREEN}Europe/London${PLAIN}         (伦敦时间 UTC+0/1)"
+    echo -e " 0. ${YELLOW}保持不变${PLAIN}"
+    
+    read -p "请输入选项 [0-6] (默认1): " TZ_CHOICE
+    
+    case "${TZ_CHOICE:-1}" in
+        1) SET_TZ="Asia/Shanghai" ;;
+        2) SET_TZ="Asia/Hong_Kong" ;;
+        3) SET_TZ="Asia/Tokyo" ;;
+        4) SET_TZ="America/Los_Angeles" ;;
+        5) SET_TZ="America/New_York" ;;
+        6) SET_TZ="Europe/London" ;;
+        0) SET_TZ="" ;;
+        *) SET_TZ="Asia/Shanghai" ;;
+    esac
 
-    # 日志限制 (100M)
+    if [ -n "$SET_TZ" ]; then
+        timedatectl set-timezone "$SET_TZ"
+        log_success "时区已更新为: $SET_TZ"
+    else
+        log_info "保持当前时区不变。"
+    fi
+
+    # --- 6.3 日志限制与清理 ---
     if [ -f /etc/systemd/journald.conf ]; then
         sed -i 's/^#SystemMaxUse=.*/SystemMaxUse=100M/' /etc/systemd/journald.conf
         sed -i 's/^SystemMaxUse=.*/SystemMaxUse=100M/' /etc/systemd/journald.conf
         systemctl restart systemd-journald
     fi
 
-    # 包清理
     log_info "清理包管理器缓存..."
     if [[ "${RELEASE}" == "centos" ]]; then 
         yum clean all
     else 
-        # 改为仅清理安装包缓存，不卸载任何软件
         apt-get clean
     fi
-    log_success "系统缓存清理完成。"
+    log_success "维护任务完成。"
 }
 
 # ==============================================================================
@@ -691,75 +833,74 @@ manual_tasks_menu() {
 #   模块 8: 卸载 SysPro 
 # ==============================================================================
 uninstall_syspro() {
-    echo -e "${RED}警告: 正在卸载 SysPro...${PLAIN}"
+    echo -e "${RED}警告: 正在卸载 SysPro 及所有扩展组件...${PLAIN}"
     
-    # 1. 优先解锁 DNS 文件
+    # 1. 解锁 DNS
     chattr -i /etc/resolv.conf >/dev/null 2>&1
     
-    # 2. 清理 DoH 服务与残留
-    if systemctl is-active syspro-doh >/dev/null 2>&1 || [ -f /etc/systemd/system/syspro-doh.service ]; then
-        log_info "正在停止 DoH 服务..."
+    # 2. 清理 ZRAM (新)
+    if systemctl is-active zram >/dev/null 2>&1; then
+        systemctl stop zram
+        systemctl disable zram
+    fi
+    rm -f /etc/systemd/system/zram.service
+    rm -f /usr/local/bin/zram-start.sh
+    
+    # 3. 清理 OOM 保护 (新)
+    rm -f /usr/local/bin/oom-protect.sh
+    crontab -l 2>/dev/null | grep -v "oom-protect" | crontab -
+    
+    # 4. 清理 Shell 配置 (新)
+    rm -f /etc/profile.d/syspro_shell.sh
+    
+    # 5. 清理 Fstrim 任务 (新)
+    rm -f /etc/cron.weekly/fstrim
+    
+    # 6. 清理 DoH 服务
+    if systemctl is-active syspro-doh >/dev/null 2>&1; then
         systemctl stop syspro-doh
         systemctl disable syspro-doh
-        rm -f /etc/systemd/system/syspro-doh.service
-        rm -rf /etc/systemd/system/syspro-doh.service.d/
-        rm -f /usr/local/bin/cloudflared
-        userdel cloudflared >/dev/null 2>&1
-        
-        # 还原 systemd-resolved 配置
-        if [ -f /etc/systemd/resolved.conf.syspro.bak ]; then
-            mv /etc/systemd/resolved.conf.syspro.bak /etc/systemd/resolved.conf
-            systemctl restart systemd-resolved 2>/dev/null
-        elif [ -f /etc/systemd/resolved.conf ]; then
-             sed -i 's/^DNSStubListener=no/#DNSStubListener=yes/' /etc/systemd/resolved.conf
-             systemctl restart systemd-resolved 2>/dev/null
-        fi
     fi
-
-    # 3. [关键修复] 强制重置 resolv.conf 为公共 DNS
-    # 防止因 DoH 停止且残留 127.0.0.1 导致断网
-    log_info "正在重置 DNS 为公共服务器 (1.1.1.1/8.8.8.8)..."
-    rm -f /etc/resolv.conf
-    echo "# SysPro Uninstalled - Network Restored" > /etc/resolv.conf
-    echo "nameserver 1.1.1.1" >> /etc/resolv.conf
-    echo "nameserver 8.8.8.8" >> /etc/resolv.conf
-    echo "options timeout:2 attempts:2" >> /etc/resolv.conf
+    rm -f /etc/systemd/system/syspro-doh.service
+    rm -f /usr/local/bin/cloudflared
     
-    # 4. 清理 Swap
+    # 7. 还原系统文件
+    rm -f /etc/resolv.conf
+    echo "nameserver 1.1.1.1" > /etc/resolv.conf
+    echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+    
     if grep -q "/swapfile" /proc/swaps; then swapoff /swapfile; fi
     rm -f /swapfile
     
-    # 5. 还原 Fstab
+    # 还原 fstab
     if [ -f /etc/fstab.syspro.bak ]; then
-        mv /etc/fstab.syspro.bak /etc/fstab && systemctl daemon-reload && mount -o remount,defaults / 2>/dev/null
+        mv /etc/fstab.syspro.bak /etc/fstab && systemctl daemon-reload && mount -o remount /
     else
         sed -i '/\/swapfile/d' /etc/fstab
     fi
 
-    # 6. 还原 Udev 规则
+    # 还原 Udev
     rm -f /etc/udev/rules.d/60-io-scheduler.rules
     [ -n "$(command -v udevadm)" ] && udevadm control --reload && udevadm trigger
     
-    # 7. 还原 Sysctl 安全参数
-    rm -f /etc/sysctl.d/98-syspro-security.conf
-    rm -f /etc/security/limits.d/99-disable-core.conf
-    sysctl --system >/dev/null 2>&1
-
-    # 8. 还原 SSH (带校验)
+    # 还原 SSH
     if [ -f /etc/ssh/sshd_config.syspro.bak ]; then
         mv /etc/ssh/sshd_config.syspro.bak /etc/ssh/sshd_config
         if sshd -t; then 
             if [[ "${RELEASE}" == "centos" ]]; then systemctl restart sshd; else systemctl restart ssh; fi
-        else
-            log_err "SSH 配置还原校验失败，未重启服务，请手动检查。"
         fi
     fi
-
-    # 9. 还原 Systemd 全局
+    
+    # 还原 Systemd
     [ -f /etc/systemd/system.conf.syspro.bak ] && mv /etc/systemd/system.conf.syspro.bak /etc/systemd/system.conf
     systemctl daemon-reload
     
-    echo -e "${GREEN}卸载完成！网络已恢复 (使用公共 DNS)。${PLAIN}"
+    # 还原 Sysctl
+    rm -f /etc/sysctl.d/98-syspro-security.conf
+    rm -f /etc/security/limits.d/99-disable-core.conf
+    sysctl --system >/dev/null 2>&1
+
+    echo -e "${GREEN}卸载完成！系统已恢复默认状态。${PLAIN}"
 }
 
 # ==============================================================================
