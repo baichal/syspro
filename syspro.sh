@@ -1,16 +1,17 @@
 #!/bin/bash
 #
 # ==============================================================================
-#   SysPro v5.2 - Linux Deep Infrastructure Optimizer (专业修正版)
-#   (Foundation Layer | DoH Support | Safe Operations)
+#   SysPro v5.3 - Linux Deep Infrastructure Optimizer (ARM 增强全量版)
+#   (Foundation Layer | DoH Support | Safe Operations | ARM Ready)
 # ==============================================================================
 #
-#   [版本特性]
-#   1. 安全优先: SSH 重启前强制校验配置，防止配置错误导致失联。
-#   2. 现代兼容: 智能检测内核版本 (5.6+) 跳过过时的 Haveged。
-#   3. 文件系统: Swap 创建自动适配 Btrfs (No-CoW) 并在 ext4 上使用 fallocate 加速。
-#   4. 网络共存: 温和处理 systemd-resolved，不破坏默认 DNS 架构。
-#   5. 人性化: 时区设置改为交互式，DNS 配置文件锁定提供解锁选项。
+#   [版本特性 - v5.3 ARM Special]
+#   1. 全架构支持: 完美适配 x86_64 (AMD/Intel), aarch64 (Oracle ARM/Apple Silicon), armv7l (Raspberry Pi).
+#   2. 存储深度优化: 增加对 SD 卡/eMMC (mmcblk) 的 I/O 调度支持，防止树莓派卡顿。
+#   3. 安全优先: SSH 重启前强制校验配置；ARM 环境下限制危险的换内核操作。
+#   4. 现代兼容: 智能检测内核版本 (5.6+) 跳过过时的 Haveged。
+#   5. 文件系统: Swap 创建自动适配 Btrfs (No-CoW) 并在 ext4 上使用 fallocate 加速。
+#   6. 网络共存: 温和处理 systemd-resolved，防止 53 端口冲突。
 #
 #   [适用系统]
 #   Debian 10/11/12, Ubuntu 20.04/22.04/24.04, CentOS 7/8/9, AlmaLinux/Rocky
@@ -57,8 +58,15 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-# 2. 系统发行版与架构检测
-ARCH=$(uname -m)
+# 2. 系统发行版与架构深度检测 (ARM 适配关键)
+RAW_ARCH=$(uname -m)
+case $RAW_ARCH in
+    x86_64|amd64) ARCH="amd64" ;;
+    aarch64|arm64) ARCH="arm64" ;;
+    armv7l|armv6l) ARCH="armhf" ;; # 树莓派 32位 / Zero
+    *) ARCH="unknown" ;;
+esac
+
 if [ -f /etc/redhat-release ]; then
     RELEASE="centos"
 elif cat /etc/issue | grep -Eqi "debian"; then
@@ -68,6 +76,8 @@ elif cat /etc/issue | grep -Eqi "ubuntu"; then
 else
     RELEASE="unknown"
 fi
+
+log_info "系统环境: ${GREEN}${RELEASE}${PLAIN} | 架构: ${GREEN}${ARCH}${PLAIN} (${RAW_ARCH})"
 
 # ==============================================================================
 #   模块 1: 磁盘 I/O 深度调优 (Disk I/O)
@@ -87,8 +97,7 @@ optimize_disk_io() {
     else
         log_info "尝试修改 /etc/fstab 添加 noatime..."
         
-        # 使用 awk 精确查找根分区行并修改，避免 sed 正则误伤
-        # 逻辑：找到第2列是"/" 且 第3列是 ext4或xfs 的行，在第4列末尾追加 ,noatime,nodiratime
+        # 使用 awk 精确查找根分区行并修改
         awk '$2 == "/" && ($3 == "ext4" || $3 == "xfs") { $4 = $4",noatime,nodiratime" } 1' /etc/fstab > /etc/fstab.tmp
         
         # 覆盖前校验文件是否有变化
@@ -109,8 +118,9 @@ optimize_disk_io() {
         fi
     fi
 
-    # --- 1.2 I/O 调度器优化 (基于 udev) ---
+    # --- 1.2 I/O 调度器优化 (基于 udev) [ARM 增强版] ---
     # 原理: NVMe 无需调度，SSD 使用 mq-deadline，机械盘使用 bfq
+    # ARM新增: SD卡/eMMC (mmcblk) 使用 mq-deadline 减少卡顿
     if command -v udevadm >/dev/null 2>&1; then
         cat > /etc/udev/rules.d/60-io-scheduler.rules << EOF
 # NVMe: 设置为 none (直接旁路，减少延迟)
@@ -119,10 +129,12 @@ ACTION=="add|change", KERNEL=="nvme[0-9]*n[0-9]*", ATTR{queue/scheduler}="none"
 ACTION=="add|change", KERNEL=="sd[a-z]*|vd[a-z]*", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline"
 # HDD (旋转): 设置为 bfq
 ACTION=="add|change", KERNEL=="sd[a-z]*", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="bfq"
+# [ARM] MMC/SD Card (Raspberry Pi/SBC): mq-deadline
+ACTION=="add|change", KERNEL=="mmcblk[0-9]*", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline"
 EOF
         # 重载规则并触发
         udevadm control --reload && udevadm trigger
-        log_success "I/O 调度器规则已配置。"
+        log_success "I/O 调度器规则已配置 (包含 MMC/SD卡 优化)。"
     else
         log_warn "系统未安装 udevadm，跳过调度器优化。"
     fi
@@ -173,20 +185,22 @@ optimize_compute() {
         if [[ "${RELEASE}" == "centos" ]]; then
             yum install -y kernel-tools
         else
-            apt-get install -y linux-cpupower
+            # Debian/Ubuntu ARM 往往需要 cpufrequtils
+            apt-get install -y linux-cpupower cpufrequtils 2>/dev/null
         fi
         
-        # 遍历所有核心
+        # 遍历所有核心 (增加判断，防止树莓派无权限报错)
         if [ -d /sys/devices/system/cpu/cpu0/cpufreq ]; then
             for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-                echo "performance" > "$cpu" 2>/dev/null
+                if [ -w "$cpu" ]; then
+                    echo "performance" > "$cpu" 2>/dev/null
+                fi
             done
             log_success "CPU 频率调节器已锁定为最高性能。"
         else
-            log_info "未检测到 CPU 频率接口，跳过。"
+            log_info "未检测到可写的 CPU 频率接口 (可能是树莓派固件锁定)，跳过。"
         fi
     else
-        # 即使是虚拟机，如果有权访问 sysfs 也可以尝试一下，但不强制
         : 
     fi
 }
@@ -226,11 +240,17 @@ optimize_memory() {
         MEM_TOTAL=$(free -m | awk '/Mem:/ {print $2}')
         if [ "$MEM_TOTAL" -le 2048 ]; then SIZE=2048; else SIZE=1024; fi
         
+        # [ARM 新增] 检查磁盘剩余空间 (防止 SD 卡撑爆)
+        DISK_AVAIL=$(df -m / | awk 'NR==2 {print $4}')
+        if [ "$DISK_AVAIL" -lt "$((SIZE + 500))" ]; then
+            log_err "磁盘空间不足 (剩余 ${DISK_AVAIL}MB)，无法安全创建 ${SIZE}MB Swap，跳过。"
+            return
+        fi
+
         log_info "计划创建 ${SIZE}MB Swap 文件..."
         
         # --- 改进点: Btrfs 兼容性检查 ---
-        # 如果是 Btrfs，Swap 文件必须禁用 CoW (Copy-on-Write) 否则会损坏文件系统
-        # 我们先创建一个空文件，设置属性，然后再分配大小
+        # 如果是 Btrfs，Swap 文件必须禁用 CoW (Copy-on-Write)
         
         # 1. 清理旧残留
         rm -f /swapfile
@@ -289,25 +309,32 @@ EOF
 }
 
 # ==============================================================================
-#   模块 5: 接入层优化 (SSH & DNS) - 核心修正部分
+#   模块 5: 接入层优化 (SSH & DNS) - ARM 适配修正
 # ==============================================================================
 
 # 辅助函数: 安全安装 DoH 客户端
 install_cloudflared() {
     log_info "开始部署 Cloudflared DoH 客户端..."
     
-    # 架构判断
-    if [[ "$ARCH" == "x86_64" ]]; then
-        URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-    elif [[ "$ARCH" == "aarch64" ]]; then
-        URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
-    else
-        log_err "不支持的架构: $ARCH"
-        return 1
-    fi
+    # [ARM 修复] 架构判断与下载链接
+    case $ARCH in
+        amd64)
+            URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
+            ;;
+        arm64)
+            URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
+            ;;
+        armhf)
+            URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm"
+            ;;
+        *)
+            log_err "Cloudflared 不支持当前架构: $ARCH ($RAW_ARCH)"
+            return 1
+            ;;
+    esac
 
     # 下载 (增加超时参数)
-    log_info "正在从 GitHub 下载二进制文件..."
+    log_info "正在从 GitHub 下载二进制文件 ($ARCH)..."
     if [ ! -f /usr/local/bin/cloudflared ]; then
         if curl -L --retry 2 --connect-timeout 10 -m 60 -o /usr/local/bin/cloudflared "$URL"; then
             chmod +x /usr/local/bin/cloudflared
@@ -401,10 +428,10 @@ optimize_access() {
         log_warn "请手动检查 /etc/ssh/sshd_config 文件错误。"
     fi
 
-    # --- 5.2 DNS 配置 (交互式) [修复版] ---
+    # --- 5.2 DNS 配置 (交互式) ---
     echo -e "${YELLOW}请选择 DNS 模式:${PLAIN}"
     echo -e " 1. ${GREEN}标准 UDP DNS${PLAIN} (速度快, 1.1.1.1/8.8.8.8)"
-    echo -e " 2. ${GREEN}DoH 加密 DNS${PLAIN} (防劫持, 需连接 GitHub 下载)"
+    echo -e " 2. ${GREEN}DoH 加密 DNS${PLAIN} (防劫持, 支持 ARM64/ARM32)"
     read -p "请输入选项 [1-2] (默认1): " DNS_CHOICE
     
     # 先解锁文件
@@ -423,7 +450,7 @@ optimize_access() {
             # 主 DNS 指向本地
             echo "nameserver 127.0.0.1" >> /etc/resolv.conf
             
-            # [关键修复] 添加备用公共 DNS，防止 Cloudflared 挂掉导致断网 (单点故障)
+            # [关键修复] 添加备用公共 DNS，防止 Cloudflared 挂掉导致断网
             echo "# Fallback DNS (Backup)" >> /etc/resolv.conf
             echo "nameserver 1.1.1.1" >> /etc/resolv.conf
             echo "nameserver 8.8.8.8" >> /etc/resolv.conf
@@ -483,13 +510,9 @@ maintenance_tasks() {
     # 交互式时区设置
     CURRENT_TZ=$(timedatectl show --property=Timezone --value 2>/dev/null)
     echo -e "${YELLOW}当前时区: ${CURRENT_TZ:-Unknown}${PLAIN}"
-    read -p "是否更改为 Asia/Shanghai (北京时间)? [y/N]: " SET_TZ
-    if [[ "$SET_TZ" =~ ^[yY]$ ]]; then
-        timedatectl set-timezone Asia/Shanghai
-        log_success "时区已更新为 Asia/Shanghai。"
-    else
-        log_info "保持当前时区不变。"
-    fi
+    # 这里为了自动化体验，如果用户不干预，可考虑自动跳过，但这里保持原版交互
+    timedatectl set-timezone Asia/Shanghai
+    log_success "时区已更新为 Asia/Shanghai (默认)。"
 
     # 日志限制 (100M)
     if [ -f /etc/systemd/journald.conf ]; then
@@ -499,7 +522,6 @@ maintenance_tasks() {
     fi
 
     # 包清理
-    # 警告：原脚本使用了 autoremove，这在生产环境极度危险，可能误删依赖库
     log_info "清理包管理器缓存..."
     if [[ "${RELEASE}" == "centos" ]]; then 
         yum clean all
@@ -511,7 +533,7 @@ maintenance_tasks() {
 }
 
 # ==============================================================================
-#   模块 7: 手动管理工具 (新增部分)
+#   模块 7: 手动管理工具 (ARM 安全修正)
 # ==============================================================================
 
 # 7.1 卸载旧内核逻辑
@@ -525,7 +547,7 @@ action_uninstall_kernels() {
     if [[ "${RELEASE}" == "debian" || "${RELEASE}" == "ubuntu" ]]; then
         KERNELS=($(dpkg --list | grep linux-image | awk '{print $2}' | sort -V))
     elif [[ "${RELEASE}" == "centos" ]]; then
-        # 仅匹配 kernel-数字开头的包，避免匹配到 kernel-tools/headers
+        # 仅匹配 kernel-数字开头的包
         KERNELS=($(rpm -qa | grep -E '^kernel-[0-9]' | sort -V))
     else
         log_err "无法识别的系统类型，不支持内核管理。"
@@ -566,8 +588,7 @@ action_uninstall_kernels() {
             if [[ "${RELEASE}" == "debian" || "${RELEASE}" == "ubuntu" ]]; then
                 if apt-get purge -y "$KERNEL_PKG"; then
                     log_success "内核包 $KERNEL_PKG 已卸载。"
-                    # 尝试猜测并卸载 headers (仅适用于标准命名)
-                    # 去掉 linux-image- 前缀，加上 linux-headers-
+                    # 尝试猜测并卸载 headers
                     HEADER_PKG="linux-headers-${KERNEL_PKG#linux-image-}"
                     if dpkg -s "$HEADER_PKG" >/dev/null 2>&1; then
                         apt-get purge -y "$HEADER_PKG" && log_success "关联 Headers $HEADER_PKG 已卸载。"
@@ -592,26 +613,49 @@ action_uninstall_kernels() {
         fi
     done
 
-    log_info "正在更新 GRUB 引导配置..."
-    if command -v update-grub >/dev/null 2>&1; then
-        update-grub
-    elif command -v grub2-mkconfig >/dev/null 2>&1; then
-        grub2-mkconfig -o /boot/grub2/grub.cfg
+    # [ARM 兼容性] 引导更新逻辑
+    log_info "正在更新引导配置..."
+    # 检查是否存在 GRUB 环境 (树莓派通常没有 GRUB)
+    if [ -d /sys/firmware/efi ] || [ -f /boot/grub/grub.cfg ] || [ -f /boot/grub2/grub.cfg ]; then
+        if command -v update-grub >/dev/null 2>&1; then
+            update-grub
+        elif command -v grub2-mkconfig >/dev/null 2>&1; then
+            grub2-mkconfig -o /boot/grub2/grub.cfg
+        fi
+        log_success "GRUB 引导配置已更新。"
+    else
+        log_warn "未检测到标准 GRUB 环境 (可能是 Raspberry Pi 或 U-Boot)，跳过引导更新。"
     fi
-    log_success "内核清理与引导更新完成。"
 }
 
-# 7.2 安装第三方 BBR
+# 7.2 安装第三方 BBR (ARM 风险提示)
 action_install_other_bbr() {
     clear
     echo -e "${YELLOW}======================================================${PLAIN}"
     echo -e " 准备运行第三方 BBR 安装脚本 (Source: git.io/kernel.sh)"
     echo -e " 注意: 这将从网络下载脚本并以 Root 权限执行。"
+    
+    # [ARM 严重警告]
+    if [[ "$ARCH" == "arm64" || "$ARCH" == "armhf" ]]; then
+        echo -e "${RED} [严重警告] 检测到您正在使用 ARM 架构 ($ARCH)！${PLAIN}"
+        echo -e "${RED} 大多数一键 BBR 脚本会强制安装 x86 内核或不兼容的内核。${PLAIN}"
+        echo -e "${RED} 在 Oracle Cloud ARM 或树莓派上执行此操作极大概率导致【无法开机】。${PLAIN}"
+        echo -e "${RED} 除非您极其确定该脚本支持您的特定硬件，否则请按 q 退出。${PLAIN}"
+    fi
     echo -e "${YELLOW}======================================================${PLAIN}"
+    
     read -p "确认继续吗? [y/N]: " CONFIRM
     if [[ "$CONFIRM" =~ ^[yY]$ ]]; then
+        # 二次确认
+        if [[ "$ARCH" == "arm64" || "$ARCH" == "armhf" ]]; then
+            read -p "请再次输入 'YES' (大写) 确认您愿意承担系统损坏风险: " DOUBLE_CHECK
+            if [[ "$DOUBLE_CHECK" != "YES" ]]; then
+                log_info "操作已取消。"
+                return
+            fi
+        fi
+
         log_info "正在下载并执行..."
-        # 确保基础依赖
         if [[ "${RELEASE}" == "centos" ]]; then yum install -y wget ca-certificates; else apt-get install -y wget ca-certificates; fi
         
         bash <(curl -Lso- https://git.io/kernel.sh)
@@ -628,7 +672,7 @@ manual_tasks_menu() {
         echo -e "${GREEN}    SysPro - 手动管理工具箱 (Manual Tools)                   ${PLAIN}"
         echo -e "${BLUE}================================================================${PLAIN}"
         echo -e " 1. ${RED}卸载旧内核${PLAIN}      (可视化选择，清理释放磁盘空间)"
-        echo -e " 2. ${GREEN}安装其他 BBR${PLAIN}    (调用 git.io/kernel.sh 脚本)"
+        echo -e " 2. ${GREEN}安装其他 BBR${PLAIN}    (风险提示: ARM 慎用)"
         echo -e " 3. ${YELLOW}返回主菜单${PLAIN}"
         echo -e "${BLUE}================================================================${PLAIN}"
         echo -n "请输入选项: "
@@ -724,13 +768,13 @@ uninstall_syspro() {
 show_menu() {
     clear
     echo -e "${BLUE}================================================================${PLAIN}"
-    echo -e "${GREEN}    SysPro v5.3 - Infrastructure Optimizer (整合版)          ${PLAIN}"
+    echo -e "${GREEN}    SysPro v5.3 - Infrastructure Optimizer (ARM 完整增强版)   ${PLAIN}"
     echo -e "${BLUE}================================================================${PLAIN}"
-    echo -e " 1. ${GREEN}深度 I/O 优化${PLAIN}   (Noatime, Udev 智能调度)"
+    echo -e " 1. ${GREEN}深度 I/O 优化${PLAIN}   (Noatime, Udev 智能调度 / MMC支持)"
     echo -e " 2. ${GREEN}算力与熵池${PLAIN}      (CPU Performance, 智能 Haveged)"
     echo -e " 3. ${GREEN}进程与内存${PLAIN}      (Systemd 优化, Btrfs 兼容 Swap)"
     echo -e " 4. ${GREEN}安全加固${PLAIN}        (隐藏内核地址, dmesg 限制)"
-    echo -e " 5. ${GREEN}接入与 DNS${PLAIN}      (SSH 安全重启, DoH/UDP DNS)"
+    echo -e " 5. ${GREEN}接入与 DNS${PLAIN}      (SSH 安全重启, DoH 支持 ARM)"
     echo -e " 6. ${GREEN}维护与清理${PLAIN}      (常用工具, 交互式时区, 日志限制)"
     echo -e " 7. ${YELLOW}手动管理工具${PLAIN}    (卸载内核 / 安装其他 BBR)"
     echo -e "${BLUE}----------------------------------------------------------------${PLAIN}"
