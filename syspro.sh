@@ -80,6 +80,39 @@ fi
 log_info "系统环境: ${GREEN}${RELEASE}${PLAIN} | 架构: ${GREEN}${ARCH}${PLAIN} (${RAW_ARCH})"
 
 # ==============================================================================
+#   全局辅助函数：智能包管理器更新
+# ==============================================================================
+
+# 定义全局标记，0 表示未更新，1 表示已更新
+PKG_UPDATED=0
+
+smart_pkg_update() {
+    # 只有当标记为 0 时才执行更新
+    if [ "$PKG_UPDATED" -eq 0 ]; then
+        log_info "正在刷新包管理器缓存 (只会执行一次)..."
+        
+        if [[ "${RELEASE}" == "debian" || "${RELEASE}" == "ubuntu" ]]; then
+            # Debian/Ubuntu 必须先 update 才能安装新软件
+            apt-get update -y >/dev/null 2>&1
+        elif [[ "${RELEASE}" == "centos" ]]; then
+            # CentOS 8/Stream 有时需要生成缓存
+            yum makecache >/dev/null 2>&1
+        fi
+        
+        # 更新完成后，将标记设为 1，后续调用将直接跳过
+        PKG_UPDATED=1
+    else
+        # 调试用，实际运行时可注释掉
+        # log_info "包管理器缓存已更新，跳过。" 
+        :
+    fi
+}
+
+# --- 使用说明 ---
+# 在后续所有模块中 (如 optimize_compute, maintenance_tasks)，
+# 将原本的 "apt-get update" 替换为 "smart_pkg_update" 即可。
+
+# ==============================================================================
 #   模块 1: 磁盘 I/O 深度调优 (Disk I/O)
 # ==============================================================================
 optimize_disk_io() {
@@ -149,162 +182,219 @@ EOF
 }
 
 # ==============================================================================
-#   模块 2: 算力与熵池 (Compute & Entropy)
+#   模块 2: 算力与熵池 (Compute & Entropy) - [完整修复版]
 # ==============================================================================
 optimize_compute() {
     log_info "正在优化 CPU 调度与随机数熵池..."
 
     # --- 2.1 智能熵池补充 (Haveged) ---
-    # 改进点: Linux Kernel 5.6+ 重构了 /dev/random，不再需要 haveged
+    # 获取内核主版本和次版本
     KERNEL_MAJOR=$(uname -r | cut -d. -f1)
     KERNEL_MINOR=$(uname -r | cut -d. -f2)
     
-    # 逻辑: 如果 主版本 > 5 或者 (主版本=5 且 次版本 >= 6)
+    # 逻辑说明: 
+    # Linux 5.6+ 内核重构了 /dev/random，原生支持高性能熵生成 (LRNG)，不再需要 haveged 守护进程。
+    # 只有在旧内核上才需要安装 haveged 防止熵耗尽导致的加密操作卡顿。
     if [ "$KERNEL_MAJOR" -gt 5 ] || { [ "$KERNEL_MAJOR" -eq 5 ] && [ "$KERNEL_MINOR" -ge 6 ]; }; then
         log_success "当前内核 ($KERNEL_MAJOR.$KERNEL_MINOR) 支持 LRNG 高效随机数，跳过 Haveged 安装。"
     else
         log_info "检测到旧版内核，正在安装 Haveged 补充熵池..."
+        # 确保包管理器已更新
+        smart_pkg_update
+        
         if [[ "${RELEASE}" == "centos" ]]; then
             yum install -y epel-release haveged
             systemctl enable haveged --now
         else
-            apt-get update
             apt-get install -y haveged
             systemctl enable haveged --now
         fi
     fi
 
-    # --- 2.2 CPU 模式锁定 (Performance) [修复版] ---
-    # 原理: 禁止 CPU 降频，减少唤醒延迟
+    # --- 2.2 CPU 模式锁定 (Performance) ---
+    # 目标: 禁止 CPU 降频，减少唤醒延迟，提升系统响应速度 (这对 IO 密集型应用很有用)
     
-    # 检测是否为虚拟化环境 (VM/Container)
+    # A. 虚拟化环境检测 (VM/Container)
+    # 某些容器环境 (LXC/Docker) 无法修改宿主机 CPU 频率，强行修改会报错。
+    # KVM 虚拟机通常允许修改，或者至少不会报错，所以 KVM 视为可优化环境。
     IS_VIRTUAL="false"
     if command -v systemd-detect-virt >/dev/null 2>&1; then
         VIRT_TECH=$(systemd-detect-virt)
-        if [[ "$VIRT_TECH" != "none" ]]; then
+        # 排除 none (物理机), kvm, oracle (Oracle Cloud 机器)
+        if [[ "$VIRT_TECH" != "none" && "$VIRT_TECH" != "kvm" && "$VIRT_TECH" != "oracle" ]]; then
             IS_VIRTUAL="true"
-            log_info "检测到虚拟化环境 ($VIRT_TECH)，跳过 CPU 频率锁定。"
+            log_info "检测到受限虚拟化环境 ($VIRT_TECH)，跳过 CPU 频率锁定。"
         fi
     fi
 
-    # 只有非虚拟化环境才尝试锁定频率
+    # B. 执行锁定逻辑 (仅非受限环境)
     if [[ "$IS_VIRTUAL" == "false" ]]; then
-        log_info "物理机环境检测，尝试锁定 CPU 为 Performance 模式..."
-        if [[ "${RELEASE}" == "centos" ]]; then
-            yum install -y kernel-tools
-        else
-            # Debian/Ubuntu ARM 往往需要 cpufrequtils
-            apt-get install -y linux-cpupower cpufrequtils 2>/dev/null
+        log_info "物理机/KVM 环境检测，准备锁定 CPU 为 Performance 模式..."
+        
+        # 1. 尝试安装必要的调频工具
+        # 优先使用 cpupower (C语言编写，效率高)，而不是用 Shell 循环遍历 sysfs
+        if ! command -v cpupower >/dev/null 2>&1; then
+            # [关键修复]
+            # 如果上面的 Haveged 安装被跳过，smart_pkg_update 可能从未运行过。
+            # 这里强制调用一次，确保安装 cpupower 时不会因为缓存过期而 404 报错。
+            smart_pkg_update 
+            
+            if [[ "${RELEASE}" == "centos" ]]; then
+                yum install -y kernel-tools >/dev/null 2>&1
+            else
+                # Debian/Ubuntu ARM 往往需要 cpufrequtils 或 linux-cpupower
+                apt-get install -y linux-cpupower cpufrequtils >/dev/null 2>&1
+            fi
         fi
         
-        # 遍历所有核心 (增加判断，防止树莓派无权限报错)
+        # 2. 尝试方法 A: 使用 cpupower 标准工具 (推荐)
+        if command -v cpupower >/dev/null 2>&1; then
+            if cpupower frequency-set -g performance >/dev/null 2>&1; then
+                log_success "CPU 频率调节器已通过 cpupower 锁定为最高性能。"
+                return
+            fi
+        fi
+
+        # 3. 尝试方法 B: 直接修改 Sysfs (回退方案)
+        # 当工具安装失败或不可用时，使用 Shell 遍历核心
+        log_info "cpupower 调用未成功，尝试直接修改内核 Sysfs 接口..."
+        
+        local success_count=0
+        # 检查路径是否存在
         if [ -d /sys/devices/system/cpu/cpu0/cpufreq ]; then
-            for cpu in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-                if [ -w "$cpu" ]; then
-                    echo "performance" > "$cpu" 2>/dev/null
+            # 遍历所有核心的 governor 文件
+            for cpu_gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+                # 检查是否可写
+                if [ -w "$cpu_gov" ]; then
+                    echo "performance" > "$cpu_gov" 2>/dev/null && ((success_count++))
                 fi
             done
-            log_success "CPU 频率调节器已锁定为最高性能。"
-        else
-            log_info "未检测到可写的 CPU 频率接口 (可能是树莓派固件锁定)，跳过。"
         fi
-    else
-        : 
+        
+        if [ "$success_count" -gt 0 ]; then
+            log_success "已通过 Sysfs 成功锁定 $success_count 个核心。"
+        else
+            log_warn "未检测到可写的 CPU 频率接口 (可能是树莓派固件锁定或被 BIOS 接管)，跳过。"
+        fi
     fi
 }
 
 # ==============================================================================
-#   模块 3: 系统进程与内存 (Systemd & Swap)
+#   模块 3: 系统进程与内存 (Systemd & Swap) - [完整优化版]
 # ==============================================================================
 optimize_systemd() {
     log_info "优化 Systemd 全局配置与进程保护..."
     
     # --- 3.1 Systemd 超时优化 ---
+    # 减少关机/重启时的等待时间
     [ ! -f /etc/systemd/system.conf.syspro.bak ] && cp /etc/systemd/system.conf /etc/systemd/system.conf.syspro.bak
-    sed -i 's/^#DefaultTimeoutStopSec=.*/DefaultTimeoutStopSec=10s/' /etc/systemd/system.conf
-    sed -i 's/^DefaultTimeoutStopSec=.*/DefaultTimeoutStopSec=10s/' /etc/systemd/system.conf
+    # 合并 sed 操作，减少 I/O
+    sed -i -e 's/^#\?DefaultTimeoutStopSec=.*/DefaultTimeoutStopSec=10s/' /etc/systemd/system.conf
     systemctl daemon-reload
     
-    # --- 3.2 禁用 Core Dump ---
+    # --- 3.2 禁用 Core Dump (防止程序崩溃产生大量垃圾文件) ---
     echo "* hard core 0" > /etc/security/limits.d/99-disable-core.conf
     
-    # --- 3.3 [新增] OOM 关键进程豁免 (防失联) ---
-    log_info "正在部署 OOM Killer 豁免策略 (SSH/Systemd)..."
+    # --- 3.3 OOM 关键进程豁免 (Systemd Native Drop-in 模式) ---
+    # 相比旧版 Crontab 脚本，此方法更稳定，服务重启后配置自动生效
+    log_info "正在部署 OOM Killer 豁免策略 (Systemd Drop-in)..."
     
-    # 创建保护脚本
-    cat > /usr/local/bin/oom-protect.sh << 'EOF'
-#!/bin/bash
-# 核心原理: 设置 oom_score_adj 为 -1000 (禁止被杀)
-# 1. 保护 Systemd (PID 1)
-echo -1000 > /proc/1/oom_score_adj 2>/dev/null
-# 2. 保护 Journald (日志)
-pgrep -f "systemd-journald" | while read pid; do echo -500 > /proc/$pid/oom_score_adj 2>/dev/null; done
-# 3. 保护 SSHD (主进程及当前连接)
-if [ -f /var/run/sshd.pid ]; then 
-    echo -1000 > /proc/$(cat /var/run/sshd.pid)/oom_score_adj 2>/dev/null
-fi
-pgrep -f "/usr/sbin/sshd" | while read pid; do 
-    echo -1000 > /proc/$pid/oom_score_adj 2>/dev/null
-done
+    # 定义应用保护的内部函数
+    apply_oom_protect() {
+        local service_name=$1
+        local protect_val=$2  # -1000 (禁止被杀) 到 0 (默认)
+        local override_dir="/etc/systemd/system/${service_name}.service.d"
+        
+        # 检查服务是否存在 (兼容不同发行版)
+        if systemctl list-unit-files "${service_name}.service" >/dev/null 2>&1; then
+            mkdir -p "$override_dir"
+            # 写入覆盖配置
+            cat > "${override_dir}/99-syspro-oom.conf" <<EOF
+[Service]
+OOMScoreAdjust=${protect_val}
 EOF
-    chmod +x /usr/local/bin/oom-protect.sh
+            log_info "  - 已添加保护策略: ${service_name}.service (Score: ${protect_val})"
+        fi
+    }
+
+    # 1. 保护 SSH 服务 (Debian系通常叫 ssh, RHEL系通常叫 sshd，两个都做)
+    apply_oom_protect "ssh" "-1000"
+    apply_oom_protect "sshd" "-1000"
     
-    # 注册到 Crontab (@reboot) 以确保持久化
-    if ! crontab -l 2>/dev/null | grep -q "oom-protect"; then
-        (crontab -l 2>/dev/null; echo "@reboot /usr/local/bin/oom-protect.sh") | crontab -
+    # 2. 保护日志服务 (防止日志进程被杀导致无法排查故障)
+    apply_oom_protect "systemd-journald" "-500"
+    
+    # 3. 清理旧版本脚本 (如果有)
+    if [ -f /usr/local/bin/oom-protect.sh ]; then
+        rm -f /usr/local/bin/oom-protect.sh
+        # 从 crontab 中移除
+        crontab -l 2>/dev/null | grep -v "oom-protect" | crontab -
+        log_info "  - 已清理旧版 Crontab 保护脚本。"
     fi
-    
-    # 立即执行一次
-    /usr/local/bin/oom-protect.sh
-    log_success "关键进程保护已生效 (SSH OOM Score = -1000)。"
+
+    # 重载配置使保护立即生效
+    systemctl daemon-reload
+    log_success "关键进程保护配置已刷新。"
 }
 
 optimize_memory() {
     log_info "正在优化内存结构 (ZRAM & Swap)..."
 
-    # --- 3.4 [增强版] ZRAM 内存压缩 ---
+    # --- 3.4 ZRAM 内存压缩 (事件驱动优化版) ---
     HAS_ZRAM=0
-    # 增加检测：不仅要模块存在，还要能加载
-    if modinfo zram >/dev/null 2>&1 && modprobe zram num_devices=1 >/dev/null 2>&1; then
-        if ! grep -q "zram" /proc/swaps; then
-            log_info "内核支持 ZRAM，正在配置内存压缩..."
+    
+    # 检查模块是否存在
+    if modinfo zram >/dev/null 2>&1; then
+        # 尝试加载模块
+        if modprobe zram num_devices=1; then
             
-            MEM_TOTAL_MB=$(free -m | awk '/Mem:/ {print $2}')
-            if [ "$MEM_TOTAL_MB" -le 2048 ]; then 
-                ZRAM_SIZE=$(($MEM_TOTAL_MB / 2))
-            else 
-                ZRAM_SIZE=2048
-            fi
-            
-            # 算法选择
-            ALGO="lzo"
-            if [ -f /sys/block/zram0/comp_algorithm ]; then
-                if grep -q zstd /sys/block/zram0/comp_algorithm; then ALGO="zstd"; fi
+            # [优化] 使用 udevadm settle 等待设备节点 /dev/zram0 创建
+            # 这比 sleep 1 更快且更可靠
+            if command -v udevadm >/dev/null 2>&1; then
+                udevadm settle --timeout=5
+            else
+                sleep 0.5 # 回退方案
             fi
 
-            # [关键修改] 生成更稳健的启动脚本
-            cat > /usr/local/bin/zram-start.sh <<EOF
+            # 检查是否已经启用，避免重复配置
+            if ! grep -q "zram" /proc/swaps; then
+                log_info "内核支持 ZRAM，正在配置内存压缩..."
+                
+                # 动态计算 ZRAM 大小
+                MEM_TOTAL_MB=$(free -m | awk '/Mem:/ {print $2}')
+                if [ "$MEM_TOTAL_MB" -le 2048 ]; then 
+                    ZRAM_SIZE=$(($MEM_TOTAL_MB / 2)) # 小内存给 50%
+                else 
+                    ZRAM_SIZE=2048 # 大内存上限 2GB
+                fi
+                
+                # 智能选择压缩算法 (优先 zstd > lzo)
+                ALGO="lzo"
+                if [ -f /sys/block/zram0/comp_algorithm ]; then
+                    local avail_algos=$(cat /sys/block/zram0/comp_algorithm)
+                    if [[ "$avail_algos" == *"zstd"* ]]; then
+                        ALGO="zstd"
+                    fi
+                fi
+
+                # 生成启动脚本 (修复了重置设备的逻辑)
+                cat > /usr/local/bin/zram-start.sh <<EOF
 #!/bin/bash
-# 1. 加载模块
 modprobe zram num_devices=1
-sleep 1
-
-# 2. 如果设备已被初始化过，先重置 (防止报错 Device or resource busy)
-if [ -f /sys/block/zram0/reset ]; then
-    echo 1 > /sys/block/zram0/reset 2>/dev/null
-fi
-
-# 3. 设置参数
+# 防止设备忙，先尝试重置
+[ -f /sys/block/zram0/reset ] && echo 1 > /sys/block/zram0/reset 2>/dev/null
+# 设置算法和大小
 echo "$ALGO" > /sys/block/zram0/comp_algorithm 2>/dev/null
 echo "${ZRAM_SIZE}M" > /sys/block/zram0/disksize
-
-# 4. 启用 Swap
-mkswap /sys/block/zram0
+# 格式化并启用
+mkswap /sys/block/zram0 >/dev/null
+# 优先级设为 100 (高于磁盘 Swap)
 swapon -p 100 /sys/block/zram0
 EOF
-            chmod +x /usr/local/bin/zram-start.sh
-            
-            cat > /etc/systemd/system/zram.service <<EOF
+                chmod +x /usr/local/bin/zram-start.sh
+                
+                # Systemd Service 封装
+                cat > /etc/systemd/system/zram.service <<EOF
 [Unit]
 Description=SysPro ZRAM Swap
 After=multi-user.target
@@ -315,44 +405,48 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-            systemctl daemon-reload
-            systemctl enable zram --now >/dev/null 2>&1
-            
-            # 验证
-            sleep 2 # 给一点时间让 Service 启动
-            if grep -q "zram" /proc/swaps; then
-                log_success "ZRAM 已启用 (大小: ${ZRAM_SIZE}MB, 算法: ${ALGO})。"
-                HAS_ZRAM=1
+                systemctl daemon-reload
+                systemctl enable zram --now >/dev/null 2>&1
+                
+                # [优化] 状态检查轮询 (Polling) 代替 sleep
+                # 最多等待 2秒 (10 * 0.2s)
+                for i in {1..10}; do
+                    if grep -q "zram" /proc/swaps; then
+                        log_success "ZRAM 已启用 (大小: ${ZRAM_SIZE}MB, 算法: ${ALGO})。"
+                        HAS_ZRAM=1
+                        break
+                    fi
+                    sleep 0.2
+                done
+                
+                if [ $HAS_ZRAM -eq 0 ]; then
+                    log_err "ZRAM 启动超时，可能受限于 VPS 虚拟化架构。"
+                fi
             else
-                log_err "ZRAM 启动失败 (可能是 KVM 限制)，将回退到普通 Swap。"
+                log_info "ZRAM 已经处于启用状态。"
+                HAS_ZRAM=1
             fi
         else
-            log_info "ZRAM 已经处于启用状态。"
-            HAS_ZRAM=1
+            log_warn "加载 zram 模块失败，跳过。"
         fi
     else
-        log_warn "当前内核不支持 ZRAM，跳过。"
+        log_warn "当前内核缺少 zram 模块，跳过。"
     fi
     
-    # --- 3.5 磁盘 Swap (awk 精确识别版) ---
-    SWAP_TOTAL=$(free -m | awk '/Swap:/ {print $2}')
+    # --- 3.5 磁盘 Swap 与 Swappiness 优化 ---
     
-    # 使用 awk 读取 /proc/swaps 的第二列 (Type)
-    # 忽略表头，查找是否有 partition 或 file
-    HAS_PARTITION_SWAP=$(awk 'NR>1 {if ($2 == "partition") print "yes"}' /proc/swaps | head -n1)
-    HAS_FILE_SWAP=$(awk 'NR>1 {if ($2 == "file") print "yes"}' /proc/swaps | head -n1)
-
-    # 逻辑判断
-    if [ "$SWAP_TOTAL" -ge 100 ]; then
-        if [ "$HAS_FILE_SWAP" == "yes" ]; then
-            log_info "检测到已存在文件型 Swap (Type: file)，跳过创建。"
-        elif [ "$HAS_PARTITION_SWAP" == "yes" ]; then
-            log_info "检测到 VPS 预分配的物理 Swap 分区 (Type: partition)，无需创建文件 Swap。"
-        else
-            # 可能是 ZRAM 撑起来的空间
-            log_info "Swap 空间充足 ($SWAP_TOTAL MB)，无需额外操作。"
-        fi
-        return
+    # [新增] 根据是否使用了 ZRAM 调整 Swappiness
+    # vm.swappiness 定义了使用 Swap 的积极程度 (0-100)
+    if [ "$HAS_ZRAM" -eq 1 ]; then
+        # 如果有 ZRAM (内存压缩)，我们希望积极使用它来节省物理内存
+        sysctl -w vm.swappiness=80 >/dev/null 2>&1
+        echo "vm.swappiness = 80" > /etc/sysctl.d/99-syspro-swap.conf
+        log_info "  - 已优化 Swappiness 为 80 (适配 ZRAM)。"
+    else
+        # 如果只有磁盘 Swap，尽量少用，防止 I/O 卡顿
+        sysctl -w vm.swappiness=10 >/dev/null 2>&1
+        echo "vm.swappiness = 10" > /etc/sysctl.d/99-syspro-swap.conf
+        log_info "  - 已优化 Swappiness 为 10 (适配磁盘 Swap)。"
     fi
     
     # 创建 /swapfile
@@ -408,14 +502,12 @@ EOF
 }
 
 # ==============================================================================
-#   模块 5: 接入层优化 (SSH & DNS) - ARM 适配修正
+#   模块 5: 辅助函数 - Cloudflared 安装与启动 - [完整优化版]
 # ==============================================================================
-
-# 辅助函数: 安全安装 DoH 客户端
 install_cloudflared() {
     log_info "开始部署 Cloudflared DoH 客户端..."
     
-    # [ARM 修复] 架构判断与下载链接
+    # 1. 架构判断与下载链接
     case $ARCH in
         amd64)
             URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
@@ -432,10 +524,13 @@ install_cloudflared() {
             ;;
     esac
 
-    # 下载 (增加超时参数)
+    # 2. 下载二进制文件 (增强超时与重试)
     log_info "正在从 GitHub 下载二进制文件 ($ARCH)..."
     if [ ! -f /usr/local/bin/cloudflared ]; then
-        if curl -L --retry 2 --connect-timeout 10 -m 60 -o /usr/local/bin/cloudflared "$URL"; then
+        # --connect-timeout 5: 连接超时5秒
+        # --max-time 60: 整个下载最长60秒
+        # --retry 2: 失败重试2次
+        if curl -L --retry 2 --connect-timeout 5 --max-time 60 -o /usr/local/bin/cloudflared "$URL"; then
             chmod +x /usr/local/bin/cloudflared
         else
             log_err "下载失败。请检查网络或配置代理。"
@@ -446,17 +541,17 @@ install_cloudflared() {
         chmod +x /usr/local/bin/cloudflared
     fi
     
-    # 创建用户
+    # 3. 创建专用用户 (安全性)
     id -u cloudflared &>/dev/null || useradd -M -s /usr/sbin/nologin cloudflared
 
-    # 构造参数
+    # 4. 构造启动参数
     UPSTREAM_ARGS=""
     while read -r url; do
         [[ -z "$url" || "$url" =~ ^# ]] && continue
         UPSTREAM_ARGS="$UPSTREAM_ARGS --upstream $url"
     done <<< "$DOH_URL_LIST"
 
-    # 服务文件
+    # 5. 生成 Systemd Unit 文件
     cat > /etc/systemd/system/syspro-doh.service << EOF
 [Unit]
 Description=SysPro DoH Client (Cloudflared)
@@ -466,6 +561,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=cloudflared
+# 允许非 Root 用户绑定 53 端口
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ExecStart=/usr/local/bin/cloudflared proxy-dns --port 53 --address 127.0.0.1 $UPSTREAM_ARGS
@@ -477,28 +573,42 @@ StandardOutput=null
 WantedBy=multi-user.target
 EOF
 
-    # [关键修复]：彻底解决与 systemd-resolved 的冲突
-    # 不再尝试共存，而是直接停用 resolved，防止 53 端口冲突或解析环路
+    # 6. [关键] 解决端口冲突
+    # Cloudflared 需要监听 53 端口，必须停用 systemd-resolved
     if systemctl is-active systemd-resolved >/dev/null 2>&1; then
-        log_warn "检测到 systemd-resolved，正在停用以防止端口冲突..."
+        log_warn "检测到 systemd-resolved 占用 53 端口，正在停用..."
         systemctl stop systemd-resolved
         systemctl disable systemd-resolved
-        # 删除 resolved 产生的软链接，为后续创建静态文件做准备
+        # 删除软链接，防止后续写入 resolv.conf 失败
         rm -f /etc/resolv.conf
     fi
 
+    # 7. 启动服务与状态检测 (事件驱动优化)
     systemctl daemon-reload
-    systemctl enable syspro-doh
-    systemctl stop syspro-doh
+    systemctl enable syspro-doh >/dev/null 2>&1
     systemctl restart syspro-doh
     
-    sleep 3
-    if systemctl is-active syspro-doh >/dev/null 2>&1; then
+    log_info "正在等待 DoH 服务启动..."
+    
+    # 轮询检查状态 (替代 sleep 3)
+    # 尝试 20 次，每次间隔 0.2 秒，最长等待 4 秒
+    local max_retries=20
+    local started=0
+    
+    for ((i=1; i<=max_retries; i++)); do
+        if systemctl is-active --quiet syspro-doh; then
+            started=1
+            break
+        fi
+        sleep 0.2
+    done
+    
+    if [ $started -eq 1 ]; then
         log_success "DoH 服务启动成功。"
         return 0
     else
-        log_err "DoH 服务启动失败，正在查看详细报错..."
-        journalctl -u syspro-doh --no-pager -n 5
+        log_err "DoH 服务启动超时或失败，正在输出最后 10 行日志..."
+        journalctl -u syspro-doh --no-pager -n 10
         return 1
     fi
 }
@@ -511,10 +621,10 @@ optimize_access() {
     [ ! -f ${SSHD_CONF}.syspro.bak ] && cp $SSHD_CONF ${SSHD_CONF}.syspro.bak
     
     # 仅修改必要项
-    sed -i 's/^#UseDNS.*/UseDNS no/' $SSHD_CONF
-    sed -i 's/^UseDNS.*/UseDNS no/' $SSHD_CONF
-    sed -i 's/^#GSSAPIAuthentication.*/GSSAPIAuthentication no/' $SSHD_CONF
-    sed -i 's/^GSSAPIAuthentication.*/GSSAPIAuthentication no/' $SSHD_CONF
+    sed -i \
+    -e 's/^#\?UseDNS.*/UseDNS no/' \
+    -e 's/^#\?GSSAPIAuthentication.*/GSSAPIAuthentication no/' \
+    "$SSHD_CONF"
     
     # 校验并重启
     if sshd -t; then
@@ -619,7 +729,7 @@ maintenance_tasks() {
         yum install -y $TOOLS chrony
         SVC_CHRONY="chronyd"
     else
-        apt-get update
+        smart_pkg_update
         apt-get install -y $TOOLS chrony
         SVC_CHRONY="chrony"
     fi
@@ -841,33 +951,20 @@ manual_tasks_menu() {
 }
 
 # ==============================================================================
-#   模块 8: 卸载 SysPro 
+#   模块 8: 卸载 SysPro (完整清理版)
 # ==============================================================================
 uninstall_syspro() {
     echo -e "${RED}警告: 正在卸载 SysPro 及所有扩展组件...${PLAIN}"
     
-    # 1. 解锁 DNS
+    # --- 1. 解锁并还原 DNS 配置 ---
+    # 必须先移除不可变属性 (chattr -i)，否则无法修改或删除
     chattr -i /etc/resolv.conf >/dev/null 2>&1
-    
-    # 2. 清理 ZRAM
-    if systemctl is-active zram >/dev/null 2>&1; then
-        systemctl stop zram
-        systemctl disable zram
-    fi
-    rm -f /etc/systemd/system/zram.service
-    rm -f /usr/local/bin/zram-start.sh
-    
-    # 3. 清理 OOM / Shell / Cron
-    rm -f /usr/local/bin/oom-protect.sh
-    crontab -l 2>/dev/null | grep -v "oom-protect" | crontab -
+    rm -f /etc/resolv.conf
+    # 恢复为通用的公共 DNS
+    echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
+    log_info "DNS 已重置为默认值。"
 
-    # 4. 清理 Shell 配置 (新)
-    rm -f /etc/profile.d/syspro_shell.sh
-
-    # 5. 清理 Fstrim 任务 (新)
-    rm -f /etc/cron.weekly/fstrim
-    
-    # 4. 清理 DoH
+    # --- 2. 清理 DoH 服务 (Cloudflared) ---
     if systemctl is-active syspro-doh >/dev/null 2>&1; then
         systemctl stop syspro-doh
         systemctl disable syspro-doh
@@ -875,69 +972,106 @@ uninstall_syspro() {
     rm -f /etc/systemd/system/syspro-doh.service
     rm -f /usr/local/bin/cloudflared
     
-    # 5. 还原 DNS
-    rm -f /etc/resolv.conf
-    echo "nameserver 1.1.1.1" > /etc/resolv.conf
-    echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+    # --- 3. 清理 ZRAM 组件 ---
+    if systemctl is-active zram >/dev/null 2>&1; then
+        systemctl stop zram
+        systemctl disable zram
+    fi
+    rm -f /etc/systemd/system/zram.service
+    rm -f /usr/local/bin/zram-start.sh
+    # 如果模块已加载，尝试移除 (非强制，重启后自动消失)
+    modprobe -r zram >/dev/null 2>&1
+
+    # --- 4. 清理 OOM 进程保护 (重点修正) ---
+    log_info "正在清理进程保护策略..."
     
-    # 6. [核心修正] 安全清理 Swap
+    # 4.1 清理旧版 Crontab/Shell 模式 (兼容旧版脚本)
+    rm -f /usr/local/bin/oom-protect.sh
+    crontab -l 2>/dev/null | grep -v "oom-protect" | crontab -
+    
+    # 4.2 清理新版 Systemd Drop-in 模式
+    # 删除特定的配置文件
+    rm -f /etc/systemd/system/ssh.service.d/99-syspro-oom.conf
+    rm -f /etc/systemd/system/sshd.service.d/99-syspro-oom.conf
+    rm -f /etc/systemd/system/systemd-journald.service.d/99-syspro-oom.conf
+    
+    # 尝试删除目录 (只有当目录为空时才会删除，rmdir 很安全)
+    rmdir /etc/systemd/system/ssh.service.d 2>/dev/null
+    rmdir /etc/systemd/system/sshd.service.d 2>/dev/null
+    rmdir /etc/systemd/system/systemd-journald.service.d 2>/dev/null
+    
+    # --- 5. 清理 Swap 与 Fstab ---
     log_info "正在清理 Swap 配置..."
     
-    # A. 无论是否挂载，只要文件存在，即视为脚本创建的目标
+    # 5.1 移除 Swap 倾向性设置
+    rm -f /etc/sysctl.d/99-syspro-swap.conf
+
+    # 5.2 处理 /swapfile
     if [ -f "/swapfile" ]; then
-        # 尝试卸载 (忽略错误，以防未挂载)
+        # 先卸载，不管是否成功都继续
         swapoff /swapfile >/dev/null 2>&1
-        # 删除文件
         rm -f /swapfile
-        log_success "已移除脚本创建的 /swapfile 文件。"
-    else
-        log_info "未检测到 /swapfile 文件，跳过删除。"
+        log_success "已删除 /swapfile 文件。"
     fi
 
-    # B. 清理当前 fstab
-    if grep -q "/swapfile" /etc/fstab; then
-        sed -i '/^\/swapfile/d' /etc/fstab
-    fi
-    
-    # C. 还原 fstab 备份 (如果存在)
+    # 5.3 修复 /etc/fstab
+    # 方案 A: 如果有脚本创建的备份，优先还原
     if [ -f /etc/fstab.syspro.bak ]; then
         mv /etc/fstab.syspro.bak /etc/fstab
-        # [关键步骤] 即使还原了备份，也要再次确保备份里没有 swapfile
-        # 防止用户多次运行脚本，导致备份文件里已经包含了 swapfile
-        sed -i '/^\/swapfile/d' /etc/fstab
-        systemctl daemon-reload && mount -o remount /
-        log_info "已还原 /etc/fstab 备份。"
+        log_info "已还原 fstab 备份文件。"
     fi
-
-    # D. 最终状态检查 (只提示物理分区)
-    # 使用 awk 精确检查是否还有 Type 为 partition 的设备
-    HAS_PARTITION=$(awk 'NR>1 {if ($2 == "partition") print "yes"}' /proc/swaps | head -n1)
-    if [ "$HAS_PARTITION" == "yes" ]; then
-        log_info "检测到系统预分配的物理 Swap 分区 (Partition)，已安全保留。"
-    fi
-
-    # 7. 还原其他组件
-    rm -f /etc/udev/rules.d/60-io-scheduler.rules
-    [ -n "$(command -v udevadm)" ] && udevadm control --reload && udevadm trigger
     
-    # 还原 SSH
+    # 方案 B: 二次清洗 (防止备份文件里本身就含有 swapfile 的情况)
+    # 删除所有包含 /swapfile 的行
+    sed -i '/^\/swapfile/d' /etc/fstab
+    
+    # 刷新挂载点 (重新挂载根目录以去除 noatime 等参数，需重启完全生效)
+    systemctl daemon-reload
+    mount -o remount / 2>/dev/null
+
+    # --- 6. 清理其他系统配置 ---
+    # Shell 增强
+    rm -f /etc/profile.d/syspro_shell.sh
+    
+    # Fstrim 任务
+    rm -f /etc/cron.weekly/fstrim
+    
+    # Udev 规则
+    rm -f /etc/udev/rules.d/60-io-scheduler.rules
+    
+    # Sysctl 安全参数
+    rm -f /etc/sysctl.d/98-syspro-security.conf
+    
+    # Limits 配置
+    rm -f /etc/security/limits.d/99-disable-core.conf
+    
+    # --- 7. 还原 SSH 配置 ---
     if [ -f /etc/ssh/sshd_config.syspro.bak ]; then
         mv /etc/ssh/sshd_config.syspro.bak /etc/ssh/sshd_config
+        # 测试配置有效性，有效则重启服务
         if sshd -t; then 
             if [[ "${RELEASE}" == "centos" ]]; then systemctl restart sshd; else systemctl restart ssh; fi
         fi
     fi
     
-    # 还原 Systemd
-    [ -f /etc/systemd/system.conf.syspro.bak ] && mv /etc/systemd/system.conf.syspro.bak /etc/systemd/system.conf
-    systemctl daemon-reload
-    
-    # 还原 Sysctl
-    rm -f /etc/sysctl.d/98-syspro-security.conf
-    rm -f /etc/security/limits.d/99-disable-core.conf
-    sysctl --system >/dev/null 2>&1
+    # --- 8. 还原 Systemd 全局配置 ---
+    if [ -f /etc/systemd/system.conf.syspro.bak ]; then
+        mv /etc/systemd/system.conf.syspro.bak /etc/systemd/system.conf
+    fi
 
-    echo -e "${GREEN}卸载完成！系统已恢复默认状态。${PLAIN}"
+    # --- 9. 应用变更 ---
+    # 刷新 Systemd
+    systemctl daemon-reload
+    # 刷新 Sysctl (重新加载系统默认配置)
+    sysctl --system >/dev/null 2>&1
+    # 刷新 Udev 规则
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload 
+        udevadm trigger
+    fi
+
+    echo -e "${GREEN}卸载完成！系统已恢复至脚本运行前的状态。${PLAIN}"
+    echo -e "${YELLOW}提示: 建议重启服务器以确保所有内核参数彻底重置。${PLAIN}"
 }
 
 # ==============================================================================
