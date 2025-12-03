@@ -377,19 +377,21 @@ optimize_memory() {
                     fi
                 fi
 
-                # 生成启动脚本 (修复了重置设备的逻辑)
+                # [关键修复] 生成启动脚本，修正设备路径
                 cat > /usr/local/bin/zram-start.sh <<EOF
 #!/bin/bash
 modprobe zram num_devices=1
+# 等待设备创建
+sleep 0.5
 # 防止设备忙，先尝试重置
 [ -f /sys/block/zram0/reset ] && echo 1 > /sys/block/zram0/reset 2>/dev/null
 # 设置算法和大小
 echo "$ALGO" > /sys/block/zram0/comp_algorithm 2>/dev/null
 echo "${ZRAM_SIZE}M" > /sys/block/zram0/disksize
-# 格式化并启用
-mkswap /sys/block/zram0 >/dev/null
+# [修复] 使用 /dev/zram0 而不是 /sys/block/zram0
+mkswap /dev/zram0 >/dev/null 2>&1
 # 优先级设为 100 (高于磁盘 Swap)
-swapon -p 100 /sys/block/zram0
+swapon -p 100 /dev/zram0
 EOF
                 chmod +x /usr/local/bin/zram-start.sh
                 
@@ -435,13 +437,20 @@ EOF
     
     # --- 3.5 磁盘 Swap 与 Swappiness 优化 ---
     
-    # [新增] 根据是否使用了 ZRAM 调整 Swappiness
+    # [新增] 检测 nftx2 是否已配置内存参数（避免冲突）
+    NFTX2_ACTIVE=0
+    if [ -f /etc/sysctl.d/99-nftx2.conf ] && grep -q "tcp_mem" /etc/sysctl.d/99-nftx2.conf 2>/dev/null; then
+        NFTX2_ACTIVE=1
+        log_warn "检测到 nftx2 网络优化已部署，将协同配置内存参数。"
+    fi
+    
+    # [核心优化] 根据是否使用了 ZRAM 调整 Swappiness
     # vm.swappiness 定义了使用 Swap 的积极程度 (0-100)
     if [ "$HAS_ZRAM" -eq 1 ]; then
         # 如果有 ZRAM (内存压缩)，我们希望积极使用它来节省物理内存
         sysctl -w vm.swappiness=80 >/dev/null 2>&1
         echo "vm.swappiness = 80" > /etc/sysctl.d/99-syspro-swap.conf
-        log_info "  - 已优化 Swappiness 为 80 (适配 ZRAM)。"
+        log_info "  - 已优化 Swappiness 为 80 (适配 ZRAM 内存压缩)。"
     else
         # 如果只有磁盘 Swap，尽量少用，防止 I/O 卡顿
         sysctl -w vm.swappiness=10 >/dev/null 2>&1
@@ -449,38 +458,84 @@ EOF
         log_info "  - 已优化 Swappiness 为 10 (适配磁盘 Swap)。"
     fi
     
+    # [新增] 如果 nftx2 活跃，添加兼容性注释
+    if [ "$NFTX2_ACTIVE" -eq 1 ]; then
+        cat >> /etc/sysctl.d/99-syspro-swap.conf <<EOF
+
+# === nftx2 兼容性说明 ===
+# 本配置与 nftx2 网络优化共存
+# nftx2 管理: TCP缓冲区、网络栈参数
+# syspro 管理: Swap策略、ZRAM、I/O调度
+EOF
+    fi
+    
+    # --- 3.6 磁盘 Swap 文件创建（如果需要）---
+    # 检查当前 Swap 总量
+    CURRENT_SWAP_MB=$(free -m | awk '/Swap:/ {print $2}')
+    
+    # 如果已有足够的 Swap（ZRAM或磁盘），跳过创建
+    if [ "$CURRENT_SWAP_MB" -ge 1024 ]; then
+        log_info "系统已有 ${CURRENT_SWAP_MB}MB Swap 空间，跳过磁盘 Swap 创建。"
+        return
+    fi
+    
     # 创建 /swapfile
     log_warn "系统 Swap 空间不足，正在创建磁盘 Swap (/swapfile)..."
     
-    if [ "$HAS_ZRAM" -eq 1 ]; then SIZE=1024; else
+    # 动态计算 Swap 文件大小
+    if [ "$HAS_ZRAM" -eq 1 ]; then 
+        SIZE=1024  # 有 ZRAM 时只需小磁盘 Swap 作为保底
+    else
         MEM_TOTAL=$(free -m | awk '/Mem:/ {print $2}')
-        if [ "$MEM_TOTAL" -le 2048 ]; then SIZE=2048; else SIZE=1024; fi
+        if [ "$MEM_TOTAL" -le 2048 ]; then 
+            SIZE=2048  # 小内存机器给 2GB
+        else 
+            SIZE=1024  # 大内存机器给 1GB 即可
+        fi
     fi
     
+    # 检查磁盘空间是否充足
     DISK_AVAIL=$(df -m / | awk 'NR==2 {print $4}')
     if [ "$DISK_AVAIL" -lt "$((SIZE + 500))" ]; then
-        log_err "磁盘空间不足，无法创建文件 Swap。"
+        log_err "磁盘空间不足（剩余 ${DISK_AVAIL}MB），无法创建 ${SIZE}MB Swap 文件。"
         return
     fi
 
+    # 删除旧文件并创建新文件
     rm -f /swapfile && touch /swapfile
+    
+    # [新增] Btrfs 文件系统特殊处理（防止 CoW 导致性能问题）
     FS_TYPE=$(df -T /swapfile | tail -1 | awk '{print $2}')
     if [ "$FS_TYPE" == "btrfs" ]; then
-        if command -v chattr >/dev/null; then chattr +C /swapfile; fi
+        if command -v chattr >/dev/null; then 
+            chattr +C /swapfile  # 禁用 Copy-on-Write
+            log_info "检测到 Btrfs 文件系统，已禁用 Swap 文件的 CoW。"
+        fi
     fi
     
+    # 快速分配空间（fallocate 比 dd 快100倍）
     if ! fallocate -l ${SIZE}M /swapfile 2>/dev/null; then
+        # 回退到 dd（某些文件系统不支持 fallocate）
         dd if=/dev/zero of=/swapfile bs=1M count=$SIZE status=none
     fi
     
+    # 设置安全权限并格式化
     chmod 600 /swapfile
-    mkswap /swapfile
+    mkswap /swapfile >/dev/null 2>&1
     swapon /swapfile
     
+    # 写入 /etc/fstab 实现开机自动挂载
     if ! grep -q "/swapfile" /etc/fstab; then 
         echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
     fi
+    
     log_success "磁盘 Swap (${SIZE}MB) 已创建并启用。"
+    
+    # 显示最终的 Swap 配置
+    log_info "当前 Swap 配置汇总:"
+    swapon --show 2>/dev/null | while read line; do
+        log_info "  $line"
+    done
 }
 
 # ==============================================================================
@@ -951,7 +1006,7 @@ manual_tasks_menu() {
 }
 
 # ==============================================================================
-#   模块 8: 卸载 SysPro (完整清理版)
+#   模块 8: 卸载 SysPro (完整清理版 v2 - 增强ZRAM处理)
 # ==============================================================================
 uninstall_syspro() {
     echo -e "${RED}警告: 正在卸载 SysPro 及所有扩展组件...${PLAIN}"
@@ -971,23 +1026,53 @@ uninstall_syspro() {
     fi
     rm -f /etc/systemd/system/syspro-doh.service
     rm -f /usr/local/bin/cloudflared
+    log_info "DoH 服务已清理。"
     
-    # --- 3. 清理 ZRAM 组件 ---
+    # --- 3. 清理 ZRAM 组件 (增强版) ---
+    log_info "正在清理 ZRAM 内存压缩组件..."
+    
+    # 3.1 停止并禁用服务
     if systemctl is-active zram >/dev/null 2>&1; then
         systemctl stop zram
         systemctl disable zram
     fi
+    
+    # 3.2 卸载 ZRAM 设备（关键步骤）
+    if grep -q "zram" /proc/swaps; then
+        log_info "正在卸载 ZRAM swap 设备..."
+        swapoff /dev/zram0 >/dev/null 2>&1
+        # 等待卸载完成
+        sleep 1
+    fi
+    
+    # 3.3 重置 ZRAM 设备
+    if [ -f /sys/block/zram0/reset ]; then
+        echo 1 > /sys/block/zram0/reset 2>/dev/null
+    fi
+    
+    # 3.4 卸载内核模块
+    if lsmod | grep -q zram; then
+        modprobe -r zram >/dev/null 2>&1
+        log_info "ZRAM 内核模块已卸载。"
+    fi
+    
+    # 3.5 删除配置文件
     rm -f /etc/systemd/system/zram.service
     rm -f /usr/local/bin/zram-start.sh
-    # 如果模块已加载，尝试移除 (非强制，重启后自动消失)
-    modprobe -r zram >/dev/null 2>&1
+    
+    # 3.6 清理模块自启配置
+    if [ -f /etc/modules-load.d/syspro.conf ]; then
+        sed -i '/zram/d' /etc/modules-load.d/syspro.conf
+    fi
+    
+    log_success "ZRAM 组件已完全清理。"
 
     # --- 4. 清理 OOM 进程保护 (重点修正) ---
     log_info "正在清理进程保护策略..."
     
     # 4.1 清理旧版 Crontab/Shell 模式 (兼容旧版脚本)
     rm -f /usr/local/bin/oom-protect.sh
-    crontab -l 2>/dev/null | grep -v "oom-protect" | crontab -
+    crontab -l 2>/dev/null | grep -v "oom-protect" | crontab - 2>/dev/null
     
     # 4.2 清理新版 Systemd Drop-in 模式
     # 删除特定的配置文件
@@ -1000,6 +1085,8 @@ uninstall_syspro() {
     rmdir /etc/systemd/system/sshd.service.d 2>/dev/null
     rmdir /etc/systemd/system/systemd-journald.service.d 2>/dev/null
     
+    log_success "OOM 保护策略已清理。"
+    
     # --- 5. 清理 Swap 与 Fstab ---
     log_info "正在清理 Swap 配置..."
     
@@ -1010,6 +1097,7 @@ uninstall_syspro() {
     if [ -f "/swapfile" ]; then
         # 先卸载，不管是否成功都继续
         swapoff /swapfile >/dev/null 2>&1
+        sleep 0.5  # 等待卸载完成
         rm -f /swapfile
         log_success "已删除 /swapfile 文件。"
     fi
@@ -1017,7 +1105,7 @@ uninstall_syspro() {
     # 5.3 修复 /etc/fstab
     # 方案 A: 如果有脚本创建的备份，优先还原
     if [ -f /etc/fstab.syspro.bak ]; then
-        mv /etc/fstab.syspro.bak /etc/fstab
+        cp /etc/fstab.syspro.bak /etc/fstab
         log_info "已还原 fstab 备份文件。"
     fi
     
@@ -1025,19 +1113,26 @@ uninstall_syspro() {
     # 删除所有包含 /swapfile 的行
     sed -i '/^\/swapfile/d' /etc/fstab
     
-    # 刷新挂载点 (重新挂载根目录以去除 noatime 等参数，需重启完全生效)
-    systemctl daemon-reload
+    # 5.4 刷新挂载点 (重新挂载根目录以去除 noatime 等参数)
     mount -o remount / 2>/dev/null
+    log_success "Swap 配置已清理。"
 
     # --- 6. 清理其他系统配置 ---
+    log_info "正在清理系统配置文件..."
+    
     # Shell 增强
     rm -f /etc/profile.d/syspro_shell.sh
     
     # Fstrim 任务
+    systemctl disable fstrim.timer >/dev/null 2>&1
     rm -f /etc/cron.weekly/fstrim
     
     # Udev 规则
     rm -f /etc/udev/rules.d/60-io-scheduler.rules
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload
+        udevadm trigger
+    fi
     
     # Sysctl 安全参数
     rm -f /etc/sysctl.d/98-syspro-security.conf
@@ -1045,33 +1140,110 @@ uninstall_syspro() {
     # Limits 配置
     rm -f /etc/security/limits.d/99-disable-core.conf
     
+    log_success "系统配置文件已清理。"
+    
     # --- 7. 还原 SSH 配置 ---
+    log_info "正在还原 SSH 配置..."
     if [ -f /etc/ssh/sshd_config.syspro.bak ]; then
-        mv /etc/ssh/sshd_config.syspro.bak /etc/ssh/sshd_config
+        cp /etc/ssh/sshd_config.syspro.bak /etc/ssh/sshd_config
         # 测试配置有效性，有效则重启服务
-        if sshd -t; then 
-            if [[ "${RELEASE}" == "centos" ]]; then systemctl restart sshd; else systemctl restart ssh; fi
+        if sshd -t 2>/dev/null; then 
+            if [[ "${RELEASE}" == "centos" ]]; then 
+                systemctl restart sshd
+            else 
+                systemctl restart ssh
+            fi
+            log_success "SSH 配置已还原。"
+        else
+            log_err "SSH 配置验证失败，保持当前配置。"
         fi
     fi
     
     # --- 8. 还原 Systemd 全局配置 ---
+    log_info "正在还原 Systemd 全局配置..."
     if [ -f /etc/systemd/system.conf.syspro.bak ]; then
-        mv /etc/systemd/system.conf.syspro.bak /etc/systemd/system.conf
+        cp /etc/systemd/system.conf.syspro.bak /etc/systemd/system.conf
+        log_success "Systemd 全局配置已还原。"
     fi
 
-    # --- 9. 应用变更 ---
+    # --- 9. 还原 CPU 频率调节器（如果可用）---
+    log_info "正在尝试还原 CPU 频率策略..."
+    # 尝试恢复为节能模式（大多数系统的默认值）
+    if command -v cpupower >/dev/null 2>&1; then
+        cpupower frequency-set -g powersave >/dev/null 2>&1 || \
+        cpupower frequency-set -g ondemand >/dev/null 2>&1 || \
+        log_warn "无法还原 CPU 频率策略（可能不支持或为虚拟机）。"
+    else
+        # 回退方案：直接写 sysfs
+        for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+            if [ -w "$gov" ]; then
+                echo "ondemand" > "$gov" 2>/dev/null || \
+                echo "powersave" > "$gov" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    # --- 10. 应用所有变更 ---
+    log_info "正在应用系统变更..."
+    
     # 刷新 Systemd
     systemctl daemon-reload
+    
     # 刷新 Sysctl (重新加载系统默认配置)
     sysctl --system >/dev/null 2>&1
+    
     # 刷新 Udev 规则
     if command -v udevadm >/dev/null 2>&1; then
         udevadm control --reload 
         udevadm trigger
     fi
 
-    echo -e "${GREEN}卸载完成！系统已恢复至脚本运行前的状态。${PLAIN}"
-    echo -e "${YELLOW}提示: 建议重启服务器以确保所有内核参数彻底重置。${PLAIN}"
+    # --- 11. 最终验证与报告 ---
+    echo ""
+    echo -e "${GREEN}================================================================${PLAIN}"
+    echo -e "${GREEN}                  卸载完成汇总报告                              ${PLAIN}"
+    echo -e "${GREEN}================================================================${PLAIN}"
+    
+    # 验证 ZRAM 是否完全清理
+    if lsmod | grep -q zram; then
+        echo -e "${YELLOW}⚠ ZRAM 模块仍在内存中（需重启完全卸载）${PLAIN}"
+    else
+        echo -e "${GREEN}✓ ZRAM 模块已完全卸载${PLAIN}"
+    fi
+    
+    # 验证 Swap 状态
+    echo -e "\n当前 Swap 状态:"
+    if swapon --show 2>/dev/null | grep -qE "zram|swapfile"; then
+        echo -e "${YELLOW}⚠ 仍有 SysPro 创建的 Swap 活跃（将在重启后消失）${PLAIN}"
+        swapon --show
+    else
+        echo -e "${GREEN}✓ 所有 SysPro Swap 已卸载${PLAIN}"
+    fi
+    
+    # 检查残留配置
+    echo -e "\n残留配置检查:"
+    LEFTOVER=0
+    
+    if [ -f /etc/sysctl.d/99-syspro-swap.conf ]; then
+        echo -e "${YELLOW}⚠ /etc/sysctl.d/99-syspro-swap.conf 仍存在${PLAIN}"
+        LEFTOVER=1
+    fi
+    
+    if [ -f /etc/systemd/system/zram.service ]; then
+        echo -e "${YELLOW}⚠ /etc/systemd/system/zram.service 仍存在${PLAIN}"
+        LEFTOVER=1
+    fi
+    
+    if [ $LEFTOVER -eq 0 ]; then
+        echo -e "${GREEN}✓ 无残留配置文件${PLAIN}"
+    fi
+    
+    echo -e "${GREEN}================================================================${PLAIN}"
+    echo -e "${YELLOW}重要提示:${PLAIN}"
+    echo -e " 1. 建议立即重启服务器以确保所有内核参数和模块彻底重置"
+    echo -e " 2. 重启命令: ${GREEN}reboot${PLAIN}"
+    echo -e " 3. 如需保留 nftx2 网络优化，重启后它将继续生效"
+    echo -e "${GREEN}================================================================${PLAIN}"
 }
 
 # ==============================================================================
