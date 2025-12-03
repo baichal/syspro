@@ -599,7 +599,7 @@ EOF
             done <<< "$DNS_IPV6_LIST"
         fi
         
-        echo "options timeout:1 attempts:2 rotate" >> /etc/resolv.conf
+        echo "options timeout:1 attempts:2" >> /etc/resolv.conf
         chattr +i /etc/resolv.conf
         log_success "标准 DNS 模式已生效 (Resolv.conf 已锁定)。"
     fi
