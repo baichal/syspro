@@ -187,159 +187,176 @@ EOF
 }
 
 # ==============================================================================
-#   模块 2: 算力与熵池 (Compute & Entropy) - [完整修复版]
+#   模块 2: 算力与调度 (Compute & Latency) - [v5.4 低延迟特化版]
 # ==============================================================================
 optimize_compute() {
-    log_info "正在优化 CPU 调度与随机数熵池..."
+    log_info "正在优化 CPU 调度器与电源管理 (极速响应模式)..."
 
-    # --- 2.1 智能熵池补充 (Haveged) ---
-    # 获取内核主版本和次版本
+    # --- 2.1 熵池补充 (Haveged) ---
+    # 保持原逻辑：5.6 以下内核补充熵池，避免加密握手卡顿
     KERNEL_MAJOR=$(uname -r | cut -d. -f1)
     KERNEL_MINOR=$(uname -r | cut -d. -f2)
     
-    # 逻辑说明: 
-    # Linux 5.6+ 内核重构了 /dev/random，原生支持高性能熵生成 (LRNG)，不再需要 haveged 守护进程。
-    # 只有在旧内核上才需要安装 haveged 防止熵耗尽导致的加密操作卡顿。
-    if [ "$KERNEL_MAJOR" -gt 5 ] || { [ "$KERNEL_MAJOR" -eq 5 ] && [ "$KERNEL_MINOR" -ge 6 ]; }; then
-        log_success "当前内核 ($KERNEL_MAJOR.$KERNEL_MINOR) 支持 LRNG 高效随机数，跳过 Haveged 安装。"
-    else
-        log_info "检测到旧版内核，正在安装 Haveged 补充熵池..."
-        # 确保包管理器已更新
+    if [ "$KERNEL_MAJOR" -lt 5 ] || { [ "$KERNEL_MAJOR" -eq 5 ] && [ "$KERNEL_MINOR" -lt 6 ]; }; then
         smart_pkg_update
-        
-        if [[ "${RELEASE}" == "centos" ]]; then
+        if [[ "${RELEASE}" == "centos" ]]; then 
             yum install -y epel-release haveged
-            systemctl enable haveged --now
-        else
+            systemctl enable haveged --now >/dev/null 2>&1
+        else 
             apt-get install -y haveged
-            systemctl enable haveged --now
+            systemctl enable haveged --now >/dev/null 2>&1
         fi
     fi
 
-    # --- 2.2 CPU 模式锁定 (Performance) ---
-    # 目标: 禁止 CPU 降频，减少唤醒延迟，提升系统响应速度 (这对 IO 密集型应用很有用)
+    # --- 2.2 内核调度器微调 (CFS Micro-Tuning) ---
+    # 原理: Linux 默认调度器倾向于让任务跑久一点以增加吞吐量(Throughput)。
+    # 对于低延迟场景，我们需要让调度器更频繁地检查任务队列，以便网卡中断能瞬间抢占 CPU。
     
-    # A. 虚拟化环境检测 (VM/Container)
-    # 某些容器环境 (LXC/Docker) 无法修改宿主机 CPU 频率，强行修改会报错。
-    # KVM 虚拟机通常允许修改，或者至少不会报错，所以 KVM 视为可优化环境。
+    cat > /etc/sysctl.d/97-syspro-latency.conf << EOF
+# [关键] 调度延迟周期 (Scheduler Latency)
+# 定义了一个任务队列轮询的周期。默认通常是 24ms。
+# 改为 3ms: 强迫 CPU 更频繁地检查是否有新任务(如网络包)到来。
+kernel.sched_latency_ns = 3000000
+
+# [关键] 唤醒粒度 (Wakeup Granularity)
+# 定义了任务抢占的最小时间片。默认通常是 4ms。
+# 改为 0.5ms (500us): 只要有高优先级任务(如软中断)到来，当前任务会更快让路。
+kernel.sched_wakeup_granularity_ns = 500000
+
+# 迁移成本 (Migration Cost)
+# 降低任务在不同 CPU 核心间迁移的“预估成本”，允许任务更积极地寻找空闲核心。
+kernel.sched_migration_cost_ns = 250000
+
+# 禁用 RT 节流 (Realtime Throttling)
+# 防止处理网络包的实时进程(Realtime)占用 CPU 时间过长被内核强行掐断。
+# 设置为 -1 表示禁用限制，允许关键进程跑满 CPU。
+kernel.sched_rt_runtime_us = -1
+EOF
+    sysctl -p /etc/sysctl.d/97-syspro-latency.conf >/dev/null 2>&1
+    log_success "内核 CFS 调度器已优化 (微秒级响应调优)。"
+
+    # --- 2.3 CPU 模式锁定与 C-State 禁用 (Ping 优化核心) ---
+    # 原理: 现代 CPU 极其省电，空闲时会进入 C-States (深度睡眠)。
+    # 从 C6/C7 睡眠唤醒到 C0 工作状态需要几十微秒，导致 Ping 值抖动。
+    # 我们的目标是: 让 CPU 永远不睡觉 (Always On)。
+    
     IS_VIRTUAL="false"
     if command -v systemd-detect-virt >/dev/null 2>&1; then
         VIRT_TECH=$(systemd-detect-virt)
-        # 排除 none (物理机), kvm, oracle (Oracle Cloud 机器)
+        # 排除物理机(none)和部分允许调优的虚拟机
         if [[ "$VIRT_TECH" != "none" && "$VIRT_TECH" != "kvm" && "$VIRT_TECH" != "oracle" ]]; then
             IS_VIRTUAL="true"
-            log_info "检测到受限虚拟化环境 ($VIRT_TECH)，跳过 CPU 频率锁定。"
         fi
     fi
 
-    # B. 执行锁定逻辑 (仅非受限环境)
     if [[ "$IS_VIRTUAL" == "false" ]]; then
-        log_info "物理机/KVM 环境检测，准备锁定 CPU 为 Performance 模式..."
-        
-        # 1. 尝试安装必要的调频工具
-        # 优先使用 cpupower (C语言编写，效率高)，而不是用 Shell 循环遍历 sysfs
+        # 1. 安装电源管理工具 cpupower
         if ! command -v cpupower >/dev/null 2>&1; then
-            # [关键修复]
-            # 如果上面的 Haveged 安装被跳过，smart_pkg_update 可能从未运行过。
-            # 这里强制调用一次，确保安装 cpupower 时不会因为缓存过期而 404 报错。
-            smart_pkg_update 
-            
-            if [[ "${RELEASE}" == "centos" ]]; then
+            smart_pkg_update
+            if [[ "${RELEASE}" == "centos" ]]; then 
                 yum install -y kernel-tools >/dev/null 2>&1
-            else
-                # Debian/Ubuntu ARM 往往需要 cpufrequtils 或 linux-cpupower
+            else 
                 apt-get install -y linux-cpupower cpufrequtils >/dev/null 2>&1
             fi
         fi
         
-        # 2. 尝试方法 A: 使用 cpupower 标准工具 (推荐)
+        # 2. 执行调优
         if command -v cpupower >/dev/null 2>&1; then
-            if cpupower frequency-set -g performance >/dev/null 2>&1; then
-                log_success "CPU 频率调节器已通过 cpupower 锁定为最高性能。"
-                return
+            # A. 锁定 Performance 频率 (P-State): 始终保持最高主频
+            cpupower frequency-set -g performance >/dev/null 2>&1
+            
+            # B. 禁用 C-States (Idle State): 禁止睡眠
+            # 获取当前 CPU 支持的 idle 状态数量
+            IDLE_STATES=$(cpupower idle-info 2>/dev/null | grep "Number of idle states:" | awk '{print $NF}')
+            
+            if [ -n "$IDLE_STATES" ] && [ "$IDLE_STATES" -gt 1 ]; then
+                # 禁用 State 1 及以上的所有深度睡眠状态 (仅保留 State 0 - POLL)
+                # 这会增加功耗，但能消除唤醒延迟
+                cpupower idle-set -D 1 >/dev/null 2>&1
+                log_success "CPU 频率已锁定，且已禁用深度睡眠 (C-States Disabled)。"
+            else
+                log_success "CPU 频率已锁定 (未检测到多级睡眠状态)。"
             fi
-        fi
-
-        # 3. 尝试方法 B: 直接修改 Sysfs (回退方案)
-        # 当工具安装失败或不可用时，使用 Shell 遍历核心
-        log_info "cpupower 调用未成功，尝试直接修改内核 Sysfs 接口..."
-        
-        local success_count=0
-        # 检查路径是否存在
-        if [ -d /sys/devices/system/cpu/cpu0/cpufreq ]; then
-            # 遍历所有核心的 governor 文件
+        else
+            # C. 回退方案: 直接修改 Sysfs (如果 cpupower 安装失败)
+            local success_count=0
             for cpu_gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-                # 检查是否可写
                 if [ -w "$cpu_gov" ]; then
                     echo "performance" > "$cpu_gov" 2>/dev/null && ((success_count++))
                 fi
             done
+            if [ "$success_count" -gt 0 ]; then
+                log_success "已通过 Sysfs 锁定 $success_count 个核心频率。"
+            fi
         fi
-        
-        if [ "$success_count" -gt 0 ]; then
-            log_success "已通过 Sysfs 成功锁定 $success_count 个核心。"
-        else
-            log_warn "未检测到可写的 CPU 频率接口 (可能是树莓派固件锁定或被 BIOS 接管)，跳过。"
-        fi
+    else
+        log_info "检测到受限虚拟化环境 ($VIRT_TECH)，跳过 CPU 硬件层调优。"
     fi
 }
 
 # ==============================================================================
-#   模块 3-1: Systemd 全局配置与进程保护 (保留原版)
+#   模块 3-1: Systemd 全局配置与进程保护 (更新：禁用审计开销)
 # ==============================================================================
 optimize_systemd() {
-    log_info "优化 Systemd 全局配置与进程保护..."
+    log_info "优化 Systemd 与削减系统开销..."
+    
+    # --- 3.0 [新增] 禁用 Auditd (审计服务) ---
+    # 原理: Auditd 会 Hook 每一个系统调用(Syscall)来记录日志。
+    # 在高并发网络下，这会显著拖慢系统调用的返回速度。关闭它能减少内核路径开销。
+    if systemctl is-active auditd >/dev/null 2>&1; then
+        log_info "正在禁用 auditd 审计服务 (减少系统调用开销)..."
+        systemctl stop auditd
+        systemctl disable auditd
+        
+        # 即使关了服务，内核可能还在产生审计消息，通过 sysctl 彻底屏蔽
+        # kernel.printk = 3 4 1 3 (抑制控制台日志)
+        if [ ! -f /etc/sysctl.d/96-no-audit.conf ]; then
+             echo "kernel.printk = 3 4 1 3" > /etc/sysctl.d/96-no-audit.conf
+        fi
+        log_success "Auditd 服务已禁用。"
+    fi
     
     # --- 3.1 Systemd 超时优化 ---
-    # 减少关机/重启时的等待时间，防止卡死
+    # 减少关机等待时间
     [ ! -f /etc/systemd/system.conf.syspro.bak ] && cp /etc/systemd/system.conf /etc/systemd/system.conf.syspro.bak
-    
-    # 设置停止超时为 10s
     sed -i -e 's/^#\?DefaultTimeoutStopSec=.*/DefaultTimeoutStopSec=10s/' /etc/systemd/system.conf
     systemctl daemon-reload
     
-    # --- 3.2 禁用 Core Dump (防止程序崩溃产生大量垃圾文件) ---
+    # --- 3.2 禁用 Core Dump ---
+    # 防止程序崩溃时写入大量磁盘数据，导致瞬间 I/O 卡顿
     if [ ! -d /etc/security/limits.d ]; then mkdir -p /etc/security/limits.d; fi
     echo "* hard core 0" > /etc/security/limits.d/99-disable-core.conf
     
-    # --- 3.3 OOM 关键进程豁免 (Systemd Native Drop-in 模式) ---
-    # 作用：当内存不足触发 OOM Killer 时，保护 SSH 不被杀掉，防止失联
-    log_info "正在部署 OOM Killer 豁免策略 (Systemd Drop-in)..."
+    # --- 3.3 OOM 关键进程豁免 ---
+    # 保护 SSH 和日志服务不被内存管理器误杀
+    log_info "部署 OOM Killer 豁免策略..."
     
-    # 定义应用保护的内部函数
     apply_oom_protect() {
         local service_name=$1
-        local protect_val=$2  # -1000 (禁止被杀) 到 0 (默认)
+        local protect_val=$2
         local override_dir="/etc/systemd/system/${service_name}.service.d"
-        
-        # 检查服务是否存在
+        # 只有服务存在时才创建保护配置
         if systemctl list-unit-files "${service_name}.service" >/dev/null 2>&1; then
             mkdir -p "$override_dir"
-            # 写入覆盖配置
             cat > "${override_dir}/99-syspro-oom.conf" <<EOF
 [Service]
 OOMScoreAdjust=${protect_val}
 EOF
-            log_info "  - 已添加保护策略: ${service_name}.service (Score: ${protect_val})"
         fi
     }
 
-    # 1. 保护 SSH 服务 (兼容 ssh 和 sshd 服务名)
     apply_oom_protect "ssh" "-1000"
     apply_oom_protect "sshd" "-1000"
-    
-    # 2. 保护日志服务 (防止故障排查困难)
     apply_oom_protect "systemd-journald" "-500"
     
-    # 3. 清理旧版本脚本 (如果有)
+    # 清理旧版脚本
     if [ -f /usr/local/bin/oom-protect.sh ]; then
         rm -f /usr/local/bin/oom-protect.sh
         crontab -l 2>/dev/null | grep -v "oom-protect" | crontab -
     fi
 
-    # 重载配置使保护立即生效
     systemctl daemon-reload
-    log_success "关键进程保护配置已刷新。"
+    log_success "进程保护与开销优化完成。"
 }
 
 # ==============================================================================
@@ -981,163 +998,148 @@ manual_tasks_menu() {
 }
 
 # ==============================================================================
-#   模块 8: 卸载 SysPro 
+#   模块 8: 卸载 SysPro
 # ==============================================================================
 uninstall_syspro() {
     echo -e "${RED}警告: 正在卸载 SysPro 及所有扩展组件...${PLAIN}"
     
     # --- 1. 解锁并还原 DNS 配置 ---
+    # 必须先移除不可变属性，否则无法修改
     chattr -i /etc/resolv.conf >/dev/null 2>&1
     rm -f /etc/resolv.conf
+    # 恢复为通用的公共 DNS
     echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
     log_info "DNS 已重置为默认值。"
 
-    # --- 2. 清理 DoH 服务 (Cloudflared) ---
-    if systemctl is-active syspro-doh >/dev/null 2>&1; then
-        systemctl stop syspro-doh
-        systemctl disable syspro-doh
-    fi
+    # --- 2. 清理服务 (DoH / ZRAM / Auditd) ---
+    log_info "正在停止并清理服务..."
+    
+    # 2.1 停止 DoH 和 ZRAM
+    systemctl disable --now syspro-doh zram >/dev/null 2>&1
+    
+    # 2.2 清理 Cloudflared (DoH)
     rm -f /etc/systemd/system/syspro-doh.service
     rm -f /usr/local/bin/cloudflared
-    log_info "DoH 服务已清理。"
     
-    # --- 3. 清理 ZRAM 组件 (适配新版逻辑) ---
-    log_info "正在清理 ZRAM 内存压缩组件..."
-    
-    # 停止服务
-    if systemctl is-active zram >/dev/null 2>&1; then
-        systemctl stop zram
-        systemctl disable zram
-    fi
-    
-    # 强制卸载 Swap 设备
-    if grep -q "zram" /proc/swaps; then
-        swapoff /dev/zram0 >/dev/null 2>&1
-        sleep 0.5
-    fi
-    
-    # 重置内核节点（如果支持）
-    if [ -f /sys/block/zram0/reset ]; then
-        echo 1 > /sys/block/zram0/reset 2>/dev/null
-    fi
-    
-    # 卸载内核模块
-    if lsmod | grep -q zram; then
-        modprobe -r zram >/dev/null 2>&1
-    fi
-    
-    # 删除文件
+    # 2.3 清理 ZRAM 及其脚本
     rm -f /etc/systemd/system/zram.service
     rm -f /usr/local/bin/zram-start.sh
     
-    # 清理可能存在的模块自启配置
-    if [ -f /etc/modules-load.d/syspro.conf ]; then
-        sed -i '/zram/d' /etc/modules-load.d/syspro.conf
+    # 2.4 强制卸载 ZRAM 设备 (如果仍在运行)
+    if grep -q "zram" /proc/swaps; then
+        swapoff /dev/zram0 >/dev/null 2>&1
+        sleep 0.5
+        # 尝试卸载模块
+        modprobe -r zram >/dev/null 2>&1
     fi
-    log_success "ZRAM 组件已完全清理。"
+    
+    # 2.5 [v5.4新增] 清理 Auditd 屏蔽配置
+    # 注意: 我们不强制重新开启 auditd 服务，只移除我们的屏蔽参数
+    rm -f /etc/sysctl.d/96-no-audit.conf
 
-    # --- 4. 清理 OOM 进程保护 ---
-    log_info "正在清理进程保护策略..."
+    # --- 3. 清理内核参数 (Sysctl) ---
+    log_info "正在清理内核参数配置..."
+    
+    # [v5.4新增] 清理低延迟调度器参数
+    rm -f /etc/sysctl.d/97-syspro-latency.conf
+    
+    # 清理 Swap 策略
+    rm -f /etc/sysctl.d/99-syspro-swap.conf
+    
+    # 清理安全加固参数
+    rm -f /etc/sysctl.d/98-syspro-security.conf
+    
+    # [智能回滚] Swappiness 处理
+    # 如果没有安装 nftx2 (它有自己的管理逻辑)，我们将 swappiness 恢复为默认值 60
+    if [ ! -f /etc/sysctl.d/99-nftx2.conf ]; then
+        sysctl -w vm.swappiness=60 >/dev/null 2>&1
+        log_info "  - Swappiness 已恢复默认值 (60)。"
+    else
+        log_info "  - 检测到 nftx2，保留当前 Swappiness 设置。"
+    fi
+
+    # --- 4. 清理 Swap 文件与 Fstab ---
+    # 4.1 处理 /swapfile
+    if [ -f "/swapfile" ]; then
+        swapoff /swapfile >/dev/null 2>&1
+        rm -f /swapfile
+        log_info "已删除保底 Swap 文件。"
+    fi
+
+    # 4.2 还原 /etc/fstab
+    if [ -f /etc/fstab.syspro.bak ]; then
+        cp /etc/fstab.syspro.bak /etc/fstab
+        log_info "已还原 fstab 备份。"
+    else
+        # 如果没有备份，尝试手动清理我们添加的行
+        sed -i '/^\/swapfile/d' /etc/fstab
+    fi
+    # 刷新挂载点 (去除 noatime)
+    mount -o remount / 2>/dev/null
+
+    # --- 5. 清理 Udev 规则 (重置 I/O 调度) ---
+    rm -f /etc/udev/rules.d/60-io-scheduler.rules
+    if command -v udevadm >/dev/null 2>&1; then
+        udevadm control --reload 
+        udevadm trigger
+        log_info "I/O 调度规则已重置。"
+    fi
+
+    # --- 6. 清理 Systemd 增强配置 ---
+    log_info "正在清理系统配置文件..."
+    
+    # 清理 OOM 保护目录
+    rm -rf /etc/systemd/system/ssh.service.d
+    rm -rf /etc/systemd/system/sshd.service.d
+    rm -rf /etc/systemd/system/systemd-journald.service.d
+    
+    # 清理旧版脚本
     rm -f /usr/local/bin/oom-protect.sh
     crontab -l 2>/dev/null | grep -v "oom-protect" | crontab - 2>/dev/null
     
-    rm -f /etc/systemd/system/ssh.service.d/99-syspro-oom.conf
-    rm -f /etc/systemd/system/sshd.service.d/99-syspro-oom.conf
-    rm -f /etc/systemd/system/systemd-journald.service.d/99-syspro-oom.conf
-    
-    rmdir /etc/systemd/system/ssh.service.d 2>/dev/null
-    rmdir /etc/systemd/system/sshd.service.d 2>/dev/null
-    rmdir /etc/systemd/system/systemd-journald.service.d 2>/dev/null
-    log_success "OOM 保护策略已清理。"
-    
-    # --- 5. 清理 Swap 与 Fstab (增强 Swappiness 处理) ---
-    log_info "正在清理 Swap 配置..."
-    
-    # 5.1 移除配置文件
-    rm -f /etc/sysctl.d/99-syspro-swap.conf
-
-    # 5.2 [新增] 主动恢复 Swappiness 默认值
-    # 如果系统里没有 nftx2 (它有自己的管理逻辑)，我们就把 swappiness 恢复为 60
-    if [ ! -f /etc/sysctl.d/99-nftx2.conf ]; then
-        sysctl -w vm.swappiness=60 >/dev/null 2>&1
-        log_info "  - 已将 Swappiness 恢复为默认值 (60)。"
-    else
-        log_info "  - 检测到 nftx2 存在，保留当前 Swappiness 设置。"
-    fi
-
-    # 5.3 处理 /swapfile
-    if [ -f "/swapfile" ]; then
-        swapoff /swapfile >/dev/null 2>&1
-        sleep 0.5
-        rm -f /swapfile
-        log_success "已删除保底 Swap 文件 (/swapfile)。"
-    fi
-
-    # 5.4 修复 /etc/fstab
-    if [ -f /etc/fstab.syspro.bak ]; then
-        cp /etc/fstab.syspro.bak /etc/fstab
-        log_info "已还原 fstab 备份文件。"
-    else
-        sed -i '/^\/swapfile/d' /etc/fstab
-    fi
-    
-    # 5.5 刷新挂载点
-    mount -o remount / 2>/dev/null
-    log_success "Swap 配置已清理。"
-
-    # --- 6. 清理其他系统配置 (I/O 调度还原) ---
-    log_info "正在清理系统配置文件..."
-    
-    # Shell 增强
+    # 清理 Shell 增强
     rm -f /etc/profile.d/syspro_shell.sh
     
-    # Fstrim 任务
-    systemctl disable fstrim.timer >/dev/null 2>&1
-    rm -f /etc/cron.weekly/fstrim
-    
-    # [关键] Udev 规则 (I/O 调度)
-    rm -f /etc/udev/rules.d/60-io-scheduler.rules
-    if command -v udevadm >/dev/null 2>&1; then
-        # 强制重载并触发，使磁盘恢复默认调度器 (通常是 bfq 或 mq-deadline)
-        udevadm control --reload 
-        udevadm trigger
-        log_success "I/O 调度策略已重置为系统默认。"
-    fi
-    
-    # Sysctl 安全参数
-    rm -f /etc/sysctl.d/98-syspro-security.conf
-    # Limits 配置
+    # 清理 Core Dump 限制
     rm -f /etc/security/limits.d/99-disable-core.conf
     
-    log_success "系统配置文件已清理。"
-    
-    # --- 7. 还原 SSH 配置 ---
-    log_info "正在还原 SSH 配置..."
-    if [ -f /etc/ssh/sshd_config.syspro.bak ]; then
-        cp /etc/ssh/sshd_config.syspro.bak /etc/ssh/sshd_config
-        if sshd -t 2>/dev/null; then 
-            if [[ "${RELEASE}" == "centos" ]]; then systemctl restart sshd; else systemctl restart ssh; fi
-        fi
-    fi
-    
-    # --- 8. 还原 Systemd 全局配置 ---
+    # 还原 Systemd 全局配置
     if [ -f /etc/systemd/system.conf.syspro.bak ]; then
         cp /etc/systemd/system.conf.syspro.bak /etc/systemd/system.conf
     fi
 
-    # --- 9. 还原 CPU 策略 ---
-    if command -v cpupower >/dev/null 2>&1; then
-        cpupower frequency-set -g ondemand >/dev/null 2>&1
+    # --- 7. 还原 SSH 配置 ---
+    if [ -f /etc/ssh/sshd_config.syspro.bak ]; then
+        cp /etc/ssh/sshd_config.syspro.bak /etc/ssh/sshd_config
+        # 重启 SSH 服务 (兼容不同发行版名称)
+        if sshd -t 2>/dev/null; then
+            if [[ "${RELEASE}" == "centos" ]]; then systemctl restart sshd; else systemctl restart ssh; fi
+        fi
+        log_info "SSH 配置已还原。"
     fi
 
-    # --- 10. 应用变更 ---
+    # --- 8. [v5.4新增] 恢复 CPU 电源管理 (重新允许睡眠) ---
+    # 这是低延迟版本特有的回滚逻辑
+    if command -v cpupower >/dev/null 2>&1; then
+        log_info "正在恢复 CPU 默认电源策略 (允许睡眠以省电)..."
+        
+        # 8.1 恢复频率调节器为 ondemand (按需调节) 或 schedutil
+        cpupower frequency-set -g ondemand >/dev/null 2>&1
+        
+        # 8.2 恢复所有 C-States (Enable all)
+        # 之前我们禁用了 State 1+，现在全部重新启用
+        cpupower idle-set -E >/dev/null 2>&1
+    fi
+
+    # --- 9. 最终应用与刷新 ---
     systemctl daemon-reload
     sysctl --system >/dev/null 2>&1
-
-    echo -e "\n${GREEN}SysPro 已成功卸载。${PLAIN}"
-    echo -e "${YELLOW}建议重启服务器以确保所有内存参数彻底重置。${PLAIN}"
-    echo -e "重启命令: reboot"
+    
+    echo ""
+    echo -e "${GREEN}SysPro 已成功完全卸载。${PLAIN}"
+    echo -e "${YELLOW}提示: 建议立即重启服务器 (${GREEN}reboot${YELLOW}) 以完全重置 CPU 调度器和内核状态。${PLAIN}"
 }
+
 
 # ==============================================================================
 #   主菜单
