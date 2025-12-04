@@ -1,17 +1,17 @@
 #!/bin/bash
 #
 # ==============================================================================
-#   SysPro Linux Deep Infrastructure Optimizer (ARM 增强全量版)
-#   (Foundation Layer | DoH Support | Safe Operations | ARM Ready)
+#   SysPro Linux Infrastructure Optimizer (ARM 版)
+#   (基础层 | DoH 支持 | 安全操作 | ARM 支持)
 # ==============================================================================
 #
 #   [版本特性 - v5.3 ARM Special]
-#   1. 全架构支持: 完美适配 x86_64 (AMD/Intel), aarch64 (Oracle ARM/Apple Silicon), armv7l (Raspberry Pi).
-#   2. 存储深度优化: 增加对 SD 卡/eMMC (mmcblk) 的 I/O 调度支持，防止树莓派卡顿。
-#   3. 安全优先: SSH 重启前强制校验配置；ARM 环境下限制危险的换内核操作。
-#   4. 现代兼容: 智能检测内核版本 (5.6+) 跳过过时的 Haveged。
-#   5. 文件系统: Swap 创建自动适配 Btrfs (No-CoW) 并在 ext4 上使用 fallocate 加速。
-#   6. 网络共存: 温和处理 systemd-resolved，防止 53 端口冲突。
+#   1. 支持多架构: 适配 x86_64 (AMD/Intel), aarch64 (Oracle ARM/Apple Silicon), armv7l (Raspberry Pi).
+#   2. 存储优化: 增加对 SD 卡/eMMC (mmcblk) 的 I/O 调度支持。
+#   3. 安全配置: SSH 重启前校验配置；ARM 环境下限制换内核操作。
+#   4. 内核兼容: 检测内核版本 (5.6+) 跳过 Haveged。
+#   5. 文件系统: Swap 创建适配 Btrfs (No-CoW) 并在 ext4 上使用 fallocate。
+#   6. 网络配置: 处理 systemd-resolved，防止 53 端口冲突。
 #
 #   [适用系统]
 #   Debian 10/11/12, Ubuntu 20.04/22.04/24.04, CentOS 7/8/9, AlmaLinux/Rocky
@@ -80,7 +80,7 @@ fi
 log_info "系统环境: ${GREEN}${RELEASE}${PLAIN} | 架构: ${GREEN}${ARCH}${PLAIN} (${RAW_ARCH})"
 
 # ==============================================================================
-#   全局辅助函数：智能包管理器更新
+#   全局辅助函数：包管理器更新
 # ==============================================================================
 
 # 定义全局标记，0 表示未更新，1 表示已更新
@@ -102,7 +102,7 @@ smart_pkg_update() {
         # 更新完成后，将标记设为 1，后续调用将直接跳过
         PKG_UPDATED=1
     else
-        # 调试用，实际运行时可注释掉
+        # 调试用
         # log_info "包管理器缓存已更新，跳过。" 
         :
     fi
@@ -113,14 +113,14 @@ smart_pkg_update() {
 # 将原本的 "apt-get update" 替换为 "smart_pkg_update" 即可。
 
 # ==============================================================================
-#   模块 1: 磁盘 I/O 深度调优 (Disk I/O) - [低延迟服务器定制版]
-#   修改说明: 移除 CPU 密集型的 bfq 算法，全面转向 mq-deadline/none
+#   模块 1: 磁盘 I/O 调优 (Disk I/O)
+#   修改说明: 移除 CPU 密集型的 bfq 算法，使用 mq-deadline/none
 # ==============================================================================
 optimize_disk_io() {
     log_info "正在优化磁盘 I/O 策略 (低延迟/网络优先模式)..."
     
     # --- 1.1 挂载参数优化 (noatime) ---
-    # 保持原逻辑：减少文件访问时间写入，大幅降低小文件 I/O 延迟
+    # 减少文件访问时间写入，降低小文件 I/O 延迟
     [ ! -f /etc/fstab.syspro.bak ] && cp /etc/fstab /etc/fstab.syspro.bak
     
     if grep -q " / " /etc/fstab && grep -E " / .*noatime" /etc/fstab >/dev/null 2>&1; then
@@ -149,21 +149,21 @@ optimize_disk_io() {
         cat > /etc/udev/rules.d/60-io-scheduler.rules << EOF
 # 1. NVMe SSD & 虚拟磁盘 (VPS/KVM)
 # 策略: none / multi-queue
-# 原因: 现代 NVMe 极快，且 VPS 的 I/O 由宿主机管理，虚拟机内部不应再做复杂调度
+# 原因: NVMe 速度快，VPS 的 I/O 由宿主机管理，虚拟机内部无需复杂调度
 ACTION=="add|change", KERNEL=="nvme[0-9]*n[0-9]*|vd[a-z]*", ATTR{queue/scheduler}="none"
 
 # 2. 物理 SATA SSD / 机械硬盘 (HDD) / SD卡 (树莓派)
 # 策略: mq-deadline
-# 原因: 相比 bfq，它更轻量，延迟更低，适合数据库和高吞吐网络服务器
+# 原因: 相比 bfq，它更轻量，延迟更低
 ACTION=="add|change", KERNEL=="sd[a-z]*|mmcblk[0-9]*", ATTR{queue/scheduler}="mq-deadline"
 
 # 3. 减少预读 (Read-ahead)
-# 对于随机读写较多的服务器，过大的预读浪费内存；设为 256KB (512扇区) 比较均衡
+# 随机读写较多时，过大的预读浪费内存；设为 256KB (512扇区) 以平衡性能
 ACTION=="add|change", KERNEL=="vd[a-z]*|sd[a-z]*", ATTR{bdi/read_ahead_kb}="256"
 EOF
         # 重载规则并触发
         udevadm control --reload && udevadm trigger
-        log_success "I/O 调度器规则已更新 (Latency-First 策略)。"
+        log_success "I/O 调度器规则已更新。"
     else
         log_warn "未找到 udevadm，跳过调度器优化。"
     fi
@@ -187,13 +187,13 @@ EOF
 }
 
 # ==============================================================================
-#   模块 2: 算力与调度 (Compute & Latency) - [v5.4 低延迟特化版]
+#   模块 2: 算力与调度 (Compute & Latency)
 # ==============================================================================
 optimize_compute() {
     log_info "正在优化 CPU 调度器与电源管理 (极速响应模式)..."
 
     # --- 2.1 熵池补充 (Haveged) ---
-    # 保持原逻辑：5.6 以下内核补充熵池，避免加密握手卡顿
+    # 5.6 以下内核补充熵池，避免加密握手卡顿
     KERNEL_MAJOR=$(uname -r | cut -d. -f1)
     KERNEL_MINOR=$(uname -r | cut -d. -f2)
     
@@ -209,36 +209,36 @@ optimize_compute() {
     fi
 
     # --- 2.2 内核调度器微调 (CFS Micro-Tuning) ---
-    # 原理: Linux 默认调度器倾向于让任务跑久一点以增加吞吐量(Throughput)。
-    # 对于低延迟场景，我们需要让调度器更频繁地检查任务队列，以便网卡中断能瞬间抢占 CPU。
+    # Linux 默认调度器倾向于让任务跑久一点以增加吞吐量(Throughput)。
+    # 对于低延迟场景，需要让调度器更频繁地检查任务队列，以便网卡中断能抢占 CPU。
     
     cat > /etc/sysctl.d/97-syspro-latency.conf << EOF
-# [关键] 调度延迟周期 (Scheduler Latency)
-# 定义了一个任务队列轮询的周期。默认通常是 24ms。
-# 改为 3ms: 强迫 CPU 更频繁地检查是否有新任务(如网络包)到来。
+# 调度延迟周期 (Scheduler Latency)
+# 定义任务队列轮询的周期。默认通常是 24ms。
+# 改为 3ms: 让 CPU 更频繁地检查是否有新任务(如网络包)到来。
 kernel.sched_latency_ns = 3000000
 
-# [关键] 唤醒粒度 (Wakeup Granularity)
-# 定义了任务抢占的最小时间片。默认通常是 4ms。
-# 改为 0.5ms (500us): 只要有高优先级任务(如软中断)到来，当前任务会更快让路。
+# 唤醒粒度 (Wakeup Granularity)
+# 定义任务抢占的最小时间片。默认通常是 4ms。
+# 改为 0.5ms (500us): 有高优先级任务(如软中断)到来时，当前任务会更快让路。
 kernel.sched_wakeup_granularity_ns = 500000
 
 # 迁移成本 (Migration Cost)
-# 降低任务在不同 CPU 核心间迁移的“预估成本”，允许任务更积极地寻找空闲核心。
+# 降低任务在不同 CPU 核心间迁移的预估成本，允许任务寻找空闲核心。
 kernel.sched_migration_cost_ns = 250000
 
 # 禁用 RT 节流 (Realtime Throttling)
-# 防止处理网络包的实时进程(Realtime)占用 CPU 时间过长被内核强行掐断。
-# 设置为 -1 表示禁用限制，允许关键进程跑满 CPU。
+# 防止处理网络包的实时进程(Realtime)占用 CPU 时间过长被内核掐断。
+# 设置为 -1 表示禁用限制，允许进程使用 CPU。
 kernel.sched_rt_runtime_us = -1
 EOF
     sysctl -p /etc/sysctl.d/97-syspro-latency.conf >/dev/null 2>&1
-    log_success "内核 CFS 调度器已优化 (微秒级响应调优)。"
+    log_success "内核 CFS 调度器已优化。"
 
-    # --- 2.3 CPU 模式锁定与 C-State 禁用 (Ping 优化核心) ---
-    # 原理: 现代 CPU 极其省电，空闲时会进入 C-States (深度睡眠)。
-    # 从 C6/C7 睡眠唤醒到 C0 工作状态需要几十微秒，导致 Ping 值抖动。
-    # 我们的目标是: 让 CPU 永远不睡觉 (Always On)。
+    # --- 2.3 CPU 模式锁定与 C-State 禁用 ---
+    # 现代 CPU 空闲时会进入 C-States (深度睡眠)。
+    # 从睡眠唤醒到工作状态需要几十微秒，导致 Ping 值抖动。
+    # 目标是: 让 CPU 保持工作状态 (Always On)。
     
     IS_VIRTUAL="false"
     if command -v systemd-detect-virt >/dev/null 2>&1; then
@@ -262,20 +262,20 @@ EOF
         
         # 2. 执行调优
         if command -v cpupower >/dev/null 2>&1; then
-            # A. 锁定 Performance 频率 (P-State): 始终保持最高主频
+            # A. 锁定 Performance 频率 (P-State): 保持最高主频
             cpupower frequency-set -g performance >/dev/null 2>&1
             
-            # B. 禁用 C-States (Idle State): 禁止睡眠
+            # B. 禁用 C-States (Idle State): 减少睡眠
             # 获取当前 CPU 支持的 idle 状态数量
             IDLE_STATES=$(cpupower idle-info 2>/dev/null | grep "Number of idle states:" | awk '{print $NF}')
             
             if [ -n "$IDLE_STATES" ] && [ "$IDLE_STATES" -gt 1 ]; then
-                # 禁用 State 1 及以上的所有深度睡眠状态 (仅保留 State 0 - POLL)
-                # 这会增加功耗，但能消除唤醒延迟
+                # 禁用 State 1 及以上的深度睡眠状态 (仅保留 State 0 - POLL)
+                # 这会增加功耗，但能减少唤醒延迟
                 cpupower idle-set -D 1 >/dev/null 2>&1
-                log_success "CPU 频率已锁定，且已禁用深度睡眠 (C-States Disabled)。"
+                log_success "CPU 频率已锁定，且已禁用深度睡眠。"
             else
-                log_success "CPU 频率已锁定 (未检测到多级睡眠状态)。"
+                log_success "CPU 频率已锁定。"
             fi
         else
             # C. 回退方案: 直接修改 Sysfs (如果 cpupower 安装失败)
@@ -295,20 +295,20 @@ EOF
 }
 
 # ==============================================================================
-#   模块 3-1: Systemd 全局配置与进程保护 (更新：禁用审计开销)
+#   模块 3-1: Systemd 全局配置与进程保护
 # ==============================================================================
 optimize_systemd() {
     log_info "优化 Systemd 与削减系统开销..."
     
-    # --- 3.0 [新增] 禁用 Auditd (审计服务) ---
-    # 原理: Auditd 会 Hook 每一个系统调用(Syscall)来记录日志。
-    # 在高并发网络下，这会显著拖慢系统调用的返回速度。关闭它能减少内核路径开销。
+    # --- 3.0 禁用 Auditd (审计服务) ---
+    # Auditd 会 Hook 每一个系统调用(Syscall)来记录日志。
+    # 在高并发网络下，这会拖慢系统调用的返回速度。关闭它能减少内核路径开销。
     if systemctl is-active auditd >/dev/null 2>&1; then
         log_info "正在禁用 auditd 审计服务 (减少系统调用开销)..."
         systemctl stop auditd
         systemctl disable auditd
         
-        # 即使关了服务，内核可能还在产生审计消息，通过 sysctl 彻底屏蔽
+        # 即使关了服务，内核可能还在产生审计消息，通过 sysctl 屏蔽
         # kernel.printk = 3 4 1 3 (抑制控制台日志)
         if [ ! -f /etc/sysctl.d/96-no-audit.conf ]; then
              echo "kernel.printk = 3 4 1 3" > /etc/sysctl.d/96-no-audit.conf
@@ -323,11 +323,11 @@ optimize_systemd() {
     systemctl daemon-reload
     
     # --- 3.2 禁用 Core Dump ---
-    # 防止程序崩溃时写入大量磁盘数据，导致瞬间 I/O 卡顿
+    # 防止程序崩溃时写入大量磁盘数据，避免 I/O 卡顿
     if [ ! -d /etc/security/limits.d ]; then mkdir -p /etc/security/limits.d; fi
     echo "* hard core 0" > /etc/security/limits.d/99-disable-core.conf
     
-    # --- 3.3 OOM 关键进程豁免 ---
+    # --- 3.3 OOM 进程豁免 ---
     # 保护 SSH 和日志服务不被内存管理器误杀
     log_info "部署 OOM Killer 豁免策略..."
     
@@ -360,7 +360,7 @@ EOF
 }
 
 # ==============================================================================
-#   模块 3-2: 内存结构优化 (ZRAM & Swap) - [轻量化/NFTX2 兼容版]
+#   模块 3-2: 内存结构优化 (ZRAM & Swap)
 #   修改说明: 
 #     1. ZRAM 大小限制为 RAM 的 20% (原50%)，避免抢占 TCP 缓冲区。
 #     2. Swappiness 降为 10，优先使用物理内存，减少 CPU 上下文切换。
@@ -368,7 +368,7 @@ EOF
 optimize_memory() {
     log_info "正在优化内存结构 (ZRAM & Swap)..."
 
-    # --- 3.4 ZRAM 内存压缩 (轻量化配置) ---
+    # --- 3.4 ZRAM 内存压缩 ---
     HAS_ZRAM=0
     
     if modinfo zram >/dev/null 2>&1; then
@@ -384,11 +384,11 @@ optimize_memory() {
 
             # 检查是否已启用
             if ! grep -q "zram" /proc/swaps; then
-                log_info "配置轻量级 ZRAM (作为 OOM 最后防线)..."
+                log_info "配置 ZRAM..."
                 
-                # [关键修改 1] 动态计算 ZRAM 大小
-                # 逻辑: 仅占用物理内存的 20%，且最大不超过 1024MB。
-                # 目的: 将 80% 以上的物理内存留给 nftx2 进行 TCP BDP 缓冲。
+                # 动态计算 ZRAM 大小
+                # 仅占用物理内存的 20%，且最大不超过 1024MB。
+                # 将 80% 以上的物理内存留给 nftx2 进行 TCP BDP 缓冲。
                 MEM_TOTAL_MB=$(free -m | awk '/Mem:/ {print $2}')
                 
                 # 计算 20%
@@ -465,14 +465,14 @@ EOF
     
     # --- 3.5 Swappiness 优化 (协同 nftx2) ---
     
-    # [新增] 检测 nftx2 是否存在
+    # 检测 nftx2 是否存在
     NFTX2_EXISTS=0
     if [ -f /etc/sysctl.d/99-nftx2.conf ] || [ -f /etc/systemd/system/nftx2.service ]; then
         NFTX2_EXISTS=1
         log_warn "检测到 nftx2 网络优化套件..."
     fi
     
-    # [关键修改 2] 强制低 Swappiness
+    # 强制低 Swappiness
     # 无论是否有 ZRAM，作为跑流量的机器，应尽量避免内存换页造成的延迟。
     # 设置为 10: 只有当物理内存剩下 10% 时才开始动用 Swap。
     sysctl -w vm.swappiness=10 >/dev/null 2>&1
@@ -549,7 +549,7 @@ EOF
 }
 
 # ==============================================================================
-#   模块 5: 辅助函数 - Cloudflared 安装与启动 - [完整优化版]
+#   模块 5: 辅助函数 - Cloudflared 安装与启动
 # ==============================================================================
 install_cloudflared() {
     log_info "开始部署 Cloudflared DoH 客户端..."
@@ -571,7 +571,7 @@ install_cloudflared() {
             ;;
     esac
 
-    # 2. 下载二进制文件 (增强超时与重试)
+    # 2. 下载二进制文件
     log_info "正在从 GitHub 下载二进制文件 ($ARCH)..."
     if [ ! -f /usr/local/bin/cloudflared ]; then
         # --connect-timeout 5: 连接超时5秒
@@ -620,7 +620,7 @@ StandardOutput=null
 WantedBy=multi-user.target
 EOF
 
-    # 6. [关键] 解决端口冲突
+    # 6. 解决端口冲突
     # Cloudflared 需要监听 53 端口，必须停用 systemd-resolved
     if systemctl is-active systemd-resolved >/dev/null 2>&1; then
         log_warn "检测到 systemd-resolved 占用 53 端口，正在停用..."
@@ -630,7 +630,7 @@ EOF
         rm -f /etc/resolv.conf
     fi
 
-    # 7. 启动服务与状态检测 (事件驱动优化)
+    # 7. 启动服务与状态检测
     systemctl daemon-reload
     systemctl enable syspro-doh >/dev/null 2>&1
     systemctl restart syspro-doh
@@ -663,7 +663,7 @@ EOF
 optimize_access() {
     log_info "正在优化接入层 (SSH & Environment)..."
 
-    # --- 5.1 SSH 优化 (带回滚) ---
+    # --- 5.1 SSH 优化 ---
     SSHD_CONF="/etc/ssh/sshd_config"
     [ ! -f ${SSHD_CONF}.syspro.bak ] && cp $SSHD_CONF ${SSHD_CONF}.syspro.bak
     
@@ -682,11 +682,11 @@ optimize_access() {
         cp ${SSHD_CONF}.syspro.bak $SSHD_CONF
     fi
 
-    # --- 5.2 [新增] Shell 交互体验优化 ---
+    # --- 5.2 Shell 优化 ---
     log_info "配置 Shell 历史记录与提示符..."
     # 写入 profile.d 以便对所有用户生效
     cat > /etc/profile.d/syspro_shell.sh << 'EOF'
-# SysPro Shell Optimization
+# SysPro Shell 配置
 # 1. 增加历史记录容量
 export HISTSIZE=10000
 export HISTFILESIZE=20000
@@ -697,7 +697,7 @@ export HISTTIMEFORMAT="%F %T "
 # 4. 防止多窗口覆盖历史记录
 shopt -s histappend
 export PROMPT_COMMAND="history -a; history -c; history -r; $PROMPT_COMMAND"
-# 5. Root 用户提示符标红 (警示作用)
+# 5. Root 用户提示符标红
 if [ "$EUID" -eq 0 ]; then
     PS1='\[\e[1;31m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
 fi
@@ -781,7 +781,7 @@ maintenance_tasks() {
         SVC_CHRONY="chrony"
     fi
     
-    # 优化 Chrony 配置 (激进同步)
+    # 优化 Chrony 配置
     CFG_CHRONY="/etc/chrony/chrony.conf"
     [ ! -f "$CFG_CHRONY" ] && CFG_CHRONY="/etc/chrony.conf"
     
@@ -794,7 +794,7 @@ maintenance_tasks() {
         log_success "时间同步服务已优化 (Chrony + Makestep)。"
     fi
     
-    # --- 6.2 [修正] 时区设置 (交互式) ---
+    # --- 6.2 时区设置 ---
     CURRENT_TZ=$(timedatectl show --property=Timezone --value 2>/dev/null || cat /etc/timezone)
     echo -e "\n${YELLOW}当前时区: ${GREEN}${CURRENT_TZ:-Unknown}${PLAIN}"
     echo -e "请选择目标时区:"
@@ -843,7 +843,7 @@ maintenance_tasks() {
 }
 
 # ==============================================================================
-#   模块 7: 手动管理工具 (ARM 安全修正)
+#   模块 7: 手动管理工具
 # ==============================================================================
 
 # 7.1 卸载旧内核逻辑
@@ -923,7 +923,7 @@ action_uninstall_kernels() {
         fi
     done
 
-    # [ARM 兼容性] 引导更新逻辑
+    # 引导更新逻辑
     log_info "正在更新引导配置..."
     # 检查是否存在 GRUB 环境 (树莓派通常没有 GRUB)
     if [ -d /sys/firmware/efi ] || [ -f /boot/grub/grub.cfg ] || [ -f /boot/grub2/grub.cfg ]; then
@@ -938,14 +938,14 @@ action_uninstall_kernels() {
     fi
 }
 
-# 7.2 安装第三方 BBR (ARM 风险提示)
+# 7.2 安装第三方 BBR
 action_install_other_bbr() {
     clear
     echo -e "${YELLOW}======================================================${PLAIN}"
     echo -e " 准备运行第三方 BBR 安装脚本 (Source: git.io/kernel.sh)"
     echo -e " 注意: 这将从网络下载脚本并以 Root 权限执行。"
     
-    # [ARM 严重警告]
+    # ARM 架构警告
     if [[ "$ARCH" == "arm64" || "$ARCH" == "armhf" ]]; then
         echo -e "${RED} [严重警告] 检测到您正在使用 ARM 架构 ($ARCH)！${PLAIN}"
         echo -e "${RED} 大多数一键 BBR 脚本会强制安装 x86 内核或不兼容的内核。${PLAIN}"
@@ -998,22 +998,22 @@ manual_tasks_menu() {
 }
 
 # ==============================================================================
-#   模块 8: 彻底抹杀日志系统 (Log Killer) - [从脚本1移植的暴力模式]
+#   模块 8: 日志系统管理
 #   功能: 停止服务 -> 清空文件 -> 锁定权限 -> 内核静音 -> 创建标记
 # ==============================================================================
 optimize_logging_killer() {
     echo -e "${RED}================================================================${PLAIN}"
-    echo -e "${RED} [警告] 正在执行：彻底抹杀日志系统 (IO/CPU 极致释放)...       ${PLAIN}"
-    echo -e "${RED} 此操作将导致系统失去所有错误记录能力，但能显著降低 IO 延迟。   ${PLAIN}"
+    echo -e "${RED} [警告] 正在执行：日志系统管理...       ${PLAIN}"
+    echo -e "${RED} 此操作将导致系统失去所有错误记录能力，降低 IO 延迟。   ${PLAIN}"
     echo -e "${RED}================================================================${PLAIN}"
     
-    # [关键步骤 0] 创建状态标记文件
-    # 作用: 就像一个"墓碑"，告诉卸载程序这里曾经发生过"屠杀"，需要特殊复活逻辑。
+    # 创建状态标记文件
+    # 作用: 用于卸载程序识别日志系统曾被修改，执行恢复逻辑。
     touch /etc/syspro_logs_killed
     log_info "已创建状态标记: /etc/syspro_logs_killed"
 
-    # [步骤 1] 停止并禁用常见的日志与崩溃报告服务
-    # 作用: 立即释放被这些守护进程占用的内存和 CPU 时间片
+    # 步骤 1: 停止并禁用常见的日志与崩溃报告服务
+    # 作用: 释放被这些守护进程占用的内存和 CPU 时间片
     log_info "正在终止所有日志守护进程..."
     # 定义服务列表：包括传统的 rsyslog, systemd日志, 以及崩溃转储工具 kdump/apport
     local SERVICES=("rsyslog" "systemd-journald" "syslog" "rsyslogd" "kdump" "apport" "abrtd" "avahi-daemon")
@@ -1029,8 +1029,8 @@ optimize_logging_killer() {
         fi
     done
 
-    # [步骤 2] 暴力配置 Journald (使其变成黑洞)
-    # 作用: 即使 systemd-journald 被核心进程强制唤醒，配置它不记录任何数据到磁盘或内存
+    # 步骤 2: 配置 Journald 不记录日志
+    # 作用: 防止 systemd-journald 记录数据到磁盘或内存
     log_info "配置 systemd-journald 为黑洞模式..."
     cat > /etc/systemd/journald.conf << EOF
 [Journal]
@@ -1041,8 +1041,8 @@ ForwardToConsole=no
 ForwardToWall=no
 EOF
 
-    # [步骤 3] 清理磁盘日志并锁定权限 (核心提速点)
-    # 作用: 删除现有的大日志文件，并物理阻断未来的写入操作 (Permission Denied)
+    # 步骤 3: 清理磁盘日志并锁定权限
+    # 作用: 删除现有日志文件，阻止未来的写入操作
     log_info "正在清理并锁定 /var/log 目录..."
     
     # 3.1 递归删除 /var/log 下的所有文件
@@ -1060,8 +1060,8 @@ EOF
     # 0555 = r-xr-xr-x (所有人只读/执行，不可写入)
     chmod -R 0555 /var/log
     
-    # 3.5 [绝杀] 使用 chattr 设置不可变属性
-    # 作用: 即使是 Root 用户也无法使用 rm 或 echo 修改文件，除非先 chattr -i
+    # 3.5 使用 chattr 设置不可变属性
+    # 作用: 防止文件被修改，包括 Root 用户
     if command -v chattr >/dev/null 2>&1; then
         chattr +i /var/log/wtmp /var/log/btmp /var/log/syslog /var/log/messages 2>/dev/null || true
         # 尝试递归锁定整个目录 (可能会失败，忽略错误)
@@ -1069,8 +1069,8 @@ EOF
         log_success "  - 文件系统锁 (chattr +i) 已施加。"
     fi
 
-    # [步骤 4] 内核层静音 (Printk)
-    # 作用: 禁止内核向控制台(Console)打印消息，减少高负载下的 CPU 中断
+    # 步骤 4: 内核层静音 (Printk)
+    # 作用: 禁止内核向控制台打印消息，减少 CPU 中断
     log_info "应用内核静音参数..."
     # 备份现有配置 (如果不存在)
     if [ ! -f /etc/sysctl.d/95-syspro-silence.conf ]; then
@@ -1081,11 +1081,11 @@ EOF
         sysctl -p /etc/sysctl.d/95-syspro-silence.conf >/dev/null 2>&1
     fi
 
-    # [步骤 5] 尝试重启 Journald 使"黑洞配置"生效
-    # 因为前面 Mask 了，这里可能启动失败，这正是我们要的效果
+    # 步骤 5: 尝试重启 Journald 使配置生效
+    # 因为前面 Mask 了，这里可能启动失败，这是预期效果
     systemctl restart systemd-journald 2>/dev/null
 
-    log_success "日志系统已彻底处决。磁盘 IO 与 CPU 中断已释放。"
+    log_success "日志系统已配置完成。磁盘 IO 与 CPU 中断已释放。"
 }
 
 # ==============================================================================
@@ -1094,26 +1094,26 @@ EOF
 uninstall_syspro() {
     echo -e "${RED}警告: 正在卸载 SysPro 及所有扩展组件...${PLAIN}"
     
-    # --- [关键逻辑] 检查是否存在日志被杀的标记 ---
+    # --- 检查是否存在日志被禁用的标记 ---
     if [ -f "/etc/syspro_logs_killed" ]; then
-        log_info "检测到日志系统曾被禁用 (/etc/syspro_logs_killed)，正在执行复活手术..."
+        log_info "检测到日志系统曾被禁用 (/etc/syspro_logs_killed)，正在执行恢复操作..."
         
-        # [恢复步骤 1] 必须先解锁文件属性 (chattr -i)
+        # 恢复步骤 1: 解锁文件属性 (chattr -i)
         # 如果不先做这一步，后续的 chmod 和 rm 都会提示 "Operation not permitted"
         log_info "  - 解锁文件系统不可变属性..."
         if command -v chattr >/dev/null 2>&1; then
             chattr -R -i /var/log 2>/dev/null
         fi
         
-        # [恢复步骤 2] 恢复目录写权限
+        # 恢复步骤 2: 恢复目录写权限
         # 恢复为标准的 755 (rwxr-xr-x)
         chmod -R 755 /var/log
         
-        # [恢复步骤 3] 移除内核静音配置
+        # 恢复步骤 3: 移除内核静音配置
         rm -f /etc/sysctl.d/95-syspro-silence.conf
         
-        # [恢复步骤 4] 恢复 Journald 配置文件
-        # 删除我们写入的"黑洞配置"
+        # 恢复步骤 4: 恢复 Journald 配置文件
+        # 删除之前写入的不记录日志配置
         rm -f /etc/systemd/journald.conf
         
         # 如果配置文件被删没了，尝试写入一个标准的默认值，防止服务报错
@@ -1124,7 +1124,7 @@ uninstall_syspro() {
              echo "SystemMaxUse=200M" >> /etc/systemd/journald.conf
         fi
         
-        # [恢复步骤 5] 解除服务屏蔽 (Unmask) 并重启
+        # 恢复步骤 5: 解除服务屏蔽 (Unmask) 并重启
         local SERVICES=("rsyslog" "systemd-journald" "syslog" "kdump")
         for svc in "${SERVICES[@]}"; do
             # Unmask: 移除指向 /dev/null 的软链接
@@ -1135,7 +1135,7 @@ uninstall_syspro() {
             systemctl restart "$svc" 2>/dev/null
         done
         
-        # [恢复步骤 6] 销毁墓碑 (删除标记文件)
+        # 恢复步骤 6: 删除标记文件
         rm -f /etc/syspro_logs_killed
         log_success "日志系统功能已恢复，服务已重启。"
     else
@@ -1208,20 +1208,20 @@ uninstall_syspro() {
 show_menu() {
     clear
     echo -e "${BLUE}================================================================${PLAIN}"
-    echo -e "${GREEN}    SysPro v5.4 - Infrastructure Optimizer (Log Killer Mod)   ${PLAIN}"
+    echo -e "${GREEN}    SysPro v5.4 - Infrastructure Configuration   ${PLAIN}"
     echo -e "${BLUE}================================================================${PLAIN}"
-    echo -e " 1. ${GREEN}深度 I/O 优化${PLAIN}   (Noatime, Udev 智能调度)"
-    echo -e " 2. ${GREEN}算力与熵池${PLAIN}      (CPU Performance, 智能 Haveged)"
-    echo -e " 3. ${GREEN}进程与内存${PLAIN}      (Systemd 优化, ZRAM, Btrfs Swap)"
-    echo -e " 4. ${GREEN}安全加固${PLAIN}        (隐藏内核地址, dmesg 限制)"
-    echo -e " 5. ${GREEN}接入与 DNS${PLAIN}      (SSH 安全重启, DoH/UDP 双模)"
+    echo -e " 1. ${GREEN}I/O 优化${PLAIN}   (Noatime, Udev 调度)"
+    echo -e " 2. ${GREEN}CPU 与熵池${PLAIN}      (CPU Performance, Haveged)"
+    echo -e " 3. ${GREEN}进程与内存${PLAIN}      (Systemd 配置, ZRAM, Btrfs Swap)"
+    echo -e " 4. ${GREEN}安全配置${PLAIN}        (隐藏内核地址, dmesg 限制)"
+    echo -e " 5. ${GREEN}接入与 DNS${PLAIN}      (SSH 配置, DoH/UDP 双模)"
     echo -e " 6. ${GREEN}维护与清理${PLAIN}      (常用工具, 时区, 缓存清理)"
     echo -e " 7. ${YELLOW}手动管理工具${PLAIN}    (卸载内核 / 安装其他 BBR)"
     echo -e "${BLUE}----------------------------------------------------------------${PLAIN}"
-    echo -e " 9. ${RED}彻底抹杀日志${PLAIN}    (暴力模式: 极速 IO)"
+    echo -e " 9. ${RED}关闭日志系统${PLAIN}    (减少 IO)"
     echo -e "${BLUE}----------------------------------------------------------------${PLAIN}"
-    echo -e " 0. ${GREEN}一键全套执行${PLAIN}    (执行 1-6，默认保留安全日志)"
-    echo -e " 8. ${RED}卸载/还原${PLAIN}       (智能识别，支持一键恢复日志)"
+    echo -e " 0. ${GREEN}一键执行所有优化${PLAIN}    (执行 1-6)"
+    echo -e " 8. ${RED}卸载/还原${PLAIN}       (还原优化，支持恢复日志)"
     echo -e " q. 退出"
     echo -e "${BLUE}================================================================${PLAIN}"
     echo -n "请输入选项: "
