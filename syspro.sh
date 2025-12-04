@@ -998,148 +998,209 @@ manual_tasks_menu() {
 }
 
 # ==============================================================================
-#   模块 8: 卸载 SysPro
+#   模块 8: 彻底抹杀日志系统 (Log Killer) - [从脚本1移植的暴力模式]
+#   功能: 停止服务 -> 清空文件 -> 锁定权限 -> 内核静音 -> 创建标记
+# ==============================================================================
+optimize_logging_killer() {
+    echo -e "${RED}================================================================${PLAIN}"
+    echo -e "${RED} [警告] 正在执行：彻底抹杀日志系统 (IO/CPU 极致释放)...       ${PLAIN}"
+    echo -e "${RED} 此操作将导致系统失去所有错误记录能力，但能显著降低 IO 延迟。   ${PLAIN}"
+    echo -e "${RED}================================================================${PLAIN}"
+    
+    # [关键步骤 0] 创建状态标记文件
+    # 作用: 就像一个"墓碑"，告诉卸载程序这里曾经发生过"屠杀"，需要特殊复活逻辑。
+    touch /etc/syspro_logs_killed
+    log_info "已创建状态标记: /etc/syspro_logs_killed"
+
+    # [步骤 1] 停止并禁用常见的日志与崩溃报告服务
+    # 作用: 立即释放被这些守护进程占用的内存和 CPU 时间片
+    log_info "正在终止所有日志守护进程..."
+    # 定义服务列表：包括传统的 rsyslog, systemd日志, 以及崩溃转储工具 kdump/apport
+    local SERVICES=("rsyslog" "systemd-journald" "syslog" "rsyslogd" "kdump" "apport" "abrtd" "avahi-daemon")
+    
+    for svc in "${SERVICES[@]}"; do
+        # 检查服务是否存在或正在运行
+        if systemctl is-active --quiet "$svc" || systemctl is-enabled --quiet "$svc"; then
+            systemctl stop "$svc" 2>/dev/null
+            systemctl disable "$svc" 2>/dev/null
+            # [重要] Mask (屏蔽) 服务：防止被其他依赖服务自动唤醒
+            systemctl mask "$svc" 2>/dev/null
+            log_info "  - 服务已停止并屏蔽: $svc"
+        fi
+    done
+
+    # [步骤 2] 暴力配置 Journald (使其变成黑洞)
+    # 作用: 即使 systemd-journald 被核心进程强制唤醒，配置它不记录任何数据到磁盘或内存
+    log_info "配置 systemd-journald 为黑洞模式..."
+    cat > /etc/systemd/journald.conf << EOF
+[Journal]
+Storage=none
+ForwardToSyslog=no
+ForwardToKMsg=no
+ForwardToConsole=no
+ForwardToWall=no
+EOF
+
+    # [步骤 3] 清理磁盘日志并锁定权限 (核心提速点)
+    # 作用: 删除现有的大日志文件，并物理阻断未来的写入操作 (Permission Denied)
+    log_info "正在清理并锁定 /var/log 目录..."
+    
+    # 3.1 递归删除 /var/log 下的所有文件
+    find /var/log -type f -delete 2>/dev/null || true
+    
+    # 3.2 重建关键的空文件 (伪装)
+    # 原因: 某些服务(如 sshd)登录时如果找不到 wtmp/btmp 会报错或拒绝登录
+    touch /var/log/wtmp /var/log/btmp /var/log/lastlog /var/log/auth.log /var/log/syslog /var/log/messages
+    
+    # 3.3 暴力清空内容 (双重保险)
+    cat /dev/null > /var/log/wtmp
+    cat /dev/null > /var/log/btmp
+    
+    # 3.4 修改文件系统权限
+    # 0555 = r-xr-xr-x (所有人只读/执行，不可写入)
+    chmod -R 0555 /var/log
+    
+    # 3.5 [绝杀] 使用 chattr 设置不可变属性
+    # 作用: 即使是 Root 用户也无法使用 rm 或 echo 修改文件，除非先 chattr -i
+    if command -v chattr >/dev/null 2>&1; then
+        chattr +i /var/log/wtmp /var/log/btmp /var/log/syslog /var/log/messages 2>/dev/null || true
+        # 尝试递归锁定整个目录 (可能会失败，忽略错误)
+        chattr -R +i /var/log 2>/dev/null || true
+        log_success "  - 文件系统锁 (chattr +i) 已施加。"
+    fi
+
+    # [步骤 4] 内核层静音 (Printk)
+    # 作用: 禁止内核向控制台(Console)打印消息，减少高负载下的 CPU 中断
+    log_info "应用内核静音参数..."
+    # 备份现有配置 (如果不存在)
+    if [ ! -f /etc/sysctl.d/95-syspro-silence.conf ]; then
+        # printk: console_loglevel=0 (紧急消息也不打)
+        echo "kernel.printk = 0 0 0 0" > /etc/sysctl.d/95-syspro-silence.conf
+        # core_pattern: 程序崩溃时不写 core dump 文件，直接丢进黑洞
+        echo "kernel.core_pattern = /dev/null" >> /etc/sysctl.d/95-syspro-silence.conf
+        sysctl -p /etc/sysctl.d/95-syspro-silence.conf >/dev/null 2>&1
+    fi
+
+    # [步骤 5] 尝试重启 Journald 使"黑洞配置"生效
+    # 因为前面 Mask 了，这里可能启动失败，这正是我们要的效果
+    systemctl restart systemd-journald 2>/dev/null
+
+    log_success "日志系统已彻底处决。磁盘 IO 与 CPU 中断已释放。"
+}
+
+# ==============================================================================
+#   模块 9: 卸载 SysPro
 # ==============================================================================
 uninstall_syspro() {
     echo -e "${RED}警告: 正在卸载 SysPro 及所有扩展组件...${PLAIN}"
     
-    # --- 1. 解锁并还原 DNS 配置 ---
-    # 必须先移除不可变属性，否则无法修改
+    # --- [关键逻辑] 检查是否存在日志被杀的标记 ---
+    if [ -f "/etc/syspro_logs_killed" ]; then
+        log_info "检测到日志系统曾被禁用 (/etc/syspro_logs_killed)，正在执行复活手术..."
+        
+        # [恢复步骤 1] 必须先解锁文件属性 (chattr -i)
+        # 如果不先做这一步，后续的 chmod 和 rm 都会提示 "Operation not permitted"
+        log_info "  - 解锁文件系统不可变属性..."
+        if command -v chattr >/dev/null 2>&1; then
+            chattr -R -i /var/log 2>/dev/null
+        fi
+        
+        # [恢复步骤 2] 恢复目录写权限
+        # 恢复为标准的 755 (rwxr-xr-x)
+        chmod -R 755 /var/log
+        
+        # [恢复步骤 3] 移除内核静音配置
+        rm -f /etc/sysctl.d/95-syspro-silence.conf
+        
+        # [恢复步骤 4] 恢复 Journald 配置文件
+        # 删除我们写入的"黑洞配置"
+        rm -f /etc/systemd/journald.conf
+        
+        # 如果配置文件被删没了，尝试写入一个标准的默认值，防止服务报错
+        if [ ! -f /etc/systemd/journald.conf ]; then
+             echo "[Journal]" > /etc/systemd/journald.conf
+             echo "Storage=auto" >> /etc/systemd/journald.conf
+             # 限制日志大小，防止恢复后日志瞬间撑爆硬盘
+             echo "SystemMaxUse=200M" >> /etc/systemd/journald.conf
+        fi
+        
+        # [恢复步骤 5] 解除服务屏蔽 (Unmask) 并重启
+        local SERVICES=("rsyslog" "systemd-journald" "syslog" "kdump")
+        for svc in "${SERVICES[@]}"; do
+            # Unmask: 移除指向 /dev/null 的软链接
+            systemctl unmask "$svc" 2>/dev/null
+            # Enable: 设置开机自启
+            systemctl enable "$svc" 2>/dev/null
+            # Restart: 立即启动
+            systemctl restart "$svc" 2>/dev/null
+        done
+        
+        # [恢复步骤 6] 销毁墓碑 (删除标记文件)
+        rm -f /etc/syspro_logs_killed
+        log_success "日志系统功能已恢复，服务已重启。"
+    else
+        log_info "日志系统未被深度修改，无需执行恢复流程。"
+    fi
+
+    # --- 以下是常规组件的卸载逻辑 ---
+    
+    log_info "正在清理 DNS 与网络组件..."
+    # 1. 解锁并重置 resolv.conf (必须先 chattr -i)
     chattr -i /etc/resolv.conf >/dev/null 2>&1
     rm -f /etc/resolv.conf
-    # 恢复为通用的公共 DNS
+    # 恢复为 Google/Cloudflare 公共 DNS
     echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
-    log_info "DNS 已重置为默认值。"
-
-    # --- 2. 清理服务 (DoH / ZRAM / Auditd) ---
-    log_info "正在停止并清理服务..."
     
-    # 2.1 停止 DoH 和 ZRAM
+    # 2. 停止并清理 DoH 和 ZRAM 服务
     systemctl disable --now syspro-doh zram >/dev/null 2>&1
-    
-    # 2.2 清理 Cloudflared (DoH)
     rm -f /etc/systemd/system/syspro-doh.service
-    rm -f /usr/local/bin/cloudflared
-    
-    # 2.3 清理 ZRAM 及其脚本
     rm -f /etc/systemd/system/zram.service
+    
+    # 3. 删除二进制文件与脚本
+    rm -f /usr/local/bin/cloudflared 
     rm -f /usr/local/bin/zram-start.sh
     
-    # 2.4 强制卸载 ZRAM 设备 (如果仍在运行)
-    if grep -q "zram" /proc/swaps; then
-        swapoff /dev/zram0 >/dev/null 2>&1
-        sleep 0.5
-        # 尝试卸载模块
-        modprobe -r zram >/dev/null 2>&1
-    fi
-    
-    # 2.5 [v5.4新增] 清理 Auditd 屏蔽配置
-    # 注意: 我们不强制重新开启 auditd 服务，只移除我们的屏蔽参数
-    rm -f /etc/sysctl.d/96-no-audit.conf
-
-    # --- 3. 清理内核参数 (Sysctl) ---
-    log_info "正在清理内核参数配置..."
-    
-    # [v5.4新增] 清理低延迟调度器参数
+    # 4. 清理内核参数 (Sysctl)
+    log_info "正在清理内核优化参数..."
     rm -f /etc/sysctl.d/97-syspro-latency.conf
-    
-    # 清理 Swap 策略
     rm -f /etc/sysctl.d/99-syspro-swap.conf
-    
-    # 清理安全加固参数
     rm -f /etc/sysctl.d/98-syspro-security.conf
+    rm -f /etc/sysctl.d/96-no-audit.conf
     
-    # [智能回滚] Swappiness 处理
-    # 如果没有安装 nftx2 (它有自己的管理逻辑)，我们将 swappiness 恢复为默认值 60
-    if [ ! -f /etc/sysctl.d/99-nftx2.conf ]; then
-        sysctl -w vm.swappiness=60 >/dev/null 2>&1
-        log_info "  - Swappiness 已恢复默认值 (60)。"
-    else
-        log_info "  - 检测到 nftx2，保留当前 Swappiness 设置。"
-    fi
-
-    # --- 4. 清理 Swap 文件与 Fstab ---
-    # 4.1 处理 /swapfile
-    if [ -f "/swapfile" ]; then
-        swapoff /swapfile >/dev/null 2>&1
+    # 5. 清理 Swap 文件与 Fstab 挂载
+    if [ -f "/swapfile" ]; then 
+        swapoff /swapfile 2>/dev/null
         rm -f /swapfile
-        log_info "已删除保底 Swap 文件。"
+        log_info "  - 已删除 /swapfile"
     fi
-
-    # 4.2 还原 /etc/fstab
-    if [ -f /etc/fstab.syspro.bak ]; then
+    # 还原 fstab (去除 noatime 等)
+    if [ -f /etc/fstab.syspro.bak ]; then 
         cp /etc/fstab.syspro.bak /etc/fstab
-        log_info "已还原 fstab 备份。"
-    else
-        # 如果没有备份，尝试手动清理我们添加的行
-        sed -i '/^\/swapfile/d' /etc/fstab
+        # 重新挂载根目录使参数生效
+        mount -o remount / 2>/dev/null
     fi
-    # 刷新挂载点 (去除 noatime)
-    mount -o remount / 2>/dev/null
-
-    # --- 5. 清理 Udev 规则 (重置 I/O 调度) ---
+    
+    # 6. 清理 Udev 规则 (IO调度)
     rm -f /etc/udev/rules.d/60-io-scheduler.rules
-    if command -v udevadm >/dev/null 2>&1; then
-        udevadm control --reload 
-        udevadm trigger
-        log_info "I/O 调度规则已重置。"
+    if command -v udevadm >/dev/null 2>&1; then 
+        udevadm control --reload && udevadm trigger
     fi
-
-    # --- 6. 清理 Systemd 增强配置 ---
-    log_info "正在清理系统配置文件..."
     
-    # 清理 OOM 保护目录
+    # 7. 清理 Systemd 全局配置与 OOM 保护
     rm -rf /etc/systemd/system/ssh.service.d
-    rm -rf /etc/systemd/system/sshd.service.d
-    rm -rf /etc/systemd/system/systemd-journald.service.d
-    
-    # 清理旧版脚本
-    rm -f /usr/local/bin/oom-protect.sh
-    crontab -l 2>/dev/null | grep -v "oom-protect" | crontab - 2>/dev/null
-    
-    # 清理 Shell 增强
-    rm -f /etc/profile.d/syspro_shell.sh
-    
-    # 清理 Core Dump 限制
     rm -f /etc/security/limits.d/99-disable-core.conf
-    
-    # 还原 Systemd 全局配置
     if [ -f /etc/systemd/system.conf.syspro.bak ]; then
         cp /etc/systemd/system.conf.syspro.bak /etc/systemd/system.conf
     fi
-
-    # --- 7. 还原 SSH 配置 ---
-    if [ -f /etc/ssh/sshd_config.syspro.bak ]; then
-        cp /etc/ssh/sshd_config.syspro.bak /etc/ssh/sshd_config
-        # 重启 SSH 服务 (兼容不同发行版名称)
-        if sshd -t 2>/dev/null; then
-            if [[ "${RELEASE}" == "centos" ]]; then systemctl restart sshd; else systemctl restart ssh; fi
-        fi
-        log_info "SSH 配置已还原。"
-    fi
-
-    # --- 8. [v5.4新增] 恢复 CPU 电源管理 (重新允许睡眠) ---
-    # 这是低延迟版本特有的回滚逻辑
-    if command -v cpupower >/dev/null 2>&1; then
-        log_info "正在恢复 CPU 默认电源策略 (允许睡眠以省电)..."
-        
-        # 8.1 恢复频率调节器为 ondemand (按需调节) 或 schedutil
-        cpupower frequency-set -g ondemand >/dev/null 2>&1
-        
-        # 8.2 恢复所有 C-States (Enable all)
-        # 之前我们禁用了 State 1+，现在全部重新启用
-        cpupower idle-set -E >/dev/null 2>&1
-    fi
-
-    # --- 9. 最终应用与刷新 ---
+    
+    # 8. 刷新系统状态
     systemctl daemon-reload
     sysctl --system >/dev/null 2>&1
     
     echo ""
     echo -e "${GREEN}SysPro 已成功完全卸载。${PLAIN}"
-    echo -e "${YELLOW}提示: 建议立即重启服务器 (${GREEN}reboot${YELLOW}) 以完全重置 CPU 调度器和内核状态。${PLAIN}"
+    echo -e "${YELLOW}提示: 建议重启服务器 (reboot) 以彻底重置内核状态。${PLAIN}"
 }
-
 
 # ==============================================================================
 #   主菜单
@@ -1147,19 +1208,20 @@ uninstall_syspro() {
 show_menu() {
     clear
     echo -e "${BLUE}================================================================${PLAIN}"
-    echo -e "${GREEN}    SysPro v5.3 - Infrastructure Optimizer (ARM 完整增强版)   ${PLAIN}"
+    echo -e "${GREEN}    SysPro v5.4 - Infrastructure Optimizer (Log Killer Mod)   ${PLAIN}"
     echo -e "${BLUE}================================================================${PLAIN}"
-    echo -e " 1. ${GREEN}深度 I/O 优化${PLAIN}   (Noatime, Udev 智能调度 / MMC支持)"
+    echo -e " 1. ${GREEN}深度 I/O 优化${PLAIN}   (Noatime, Udev 智能调度)"
     echo -e " 2. ${GREEN}算力与熵池${PLAIN}      (CPU Performance, 智能 Haveged)"
-    echo -e " 3. ${GREEN}进程与内存${PLAIN}      (Systemd 优化, Btrfs 兼容 Swap)"
+    echo -e " 3. ${GREEN}进程与内存${PLAIN}      (Systemd 优化, ZRAM, Btrfs Swap)"
     echo -e " 4. ${GREEN}安全加固${PLAIN}        (隐藏内核地址, dmesg 限制)"
-    echo -e " 5. ${GREEN}接入与 DNS${PLAIN}      (SSH 安全重启, DoH 支持 ARM)"
-    echo -e " 6. ${GREEN}维护与清理${PLAIN}      (常用工具, 交互式时区, 日志限制)"
+    echo -e " 5. ${GREEN}接入与 DNS${PLAIN}      (SSH 安全重启, DoH/UDP 双模)"
+    echo -e " 6. ${GREEN}维护与清理${PLAIN}      (常用工具, 时区, 缓存清理)"
     echo -e " 7. ${YELLOW}手动管理工具${PLAIN}    (卸载内核 / 安装其他 BBR)"
     echo -e "${BLUE}----------------------------------------------------------------${PLAIN}"
-    echo -e " 0. ${GREEN}一键全套执行${PLAIN}    (推荐: 依次执行 1-6)"
-    echo -e " 8. ${RED}卸载/还原${PLAIN}       (恢复默认配置)"
-    echo -e " 9. ${YELLOW}解锁 DNS 文件${PLAIN}   (移除 chattr +i 锁以便手动修改)"
+    echo -e " 9. ${RED}彻底抹杀日志${PLAIN}    (暴力模式: 极速 IO)"
+    echo -e "${BLUE}----------------------------------------------------------------${PLAIN}"
+    echo -e " 0. ${GREEN}一键全套执行${PLAIN}    (执行 1-6，默认保留安全日志)"
+    echo -e " 8. ${RED}卸载/还原${PLAIN}       (智能识别，支持一键恢复日志)"
     echo -e " q. 退出"
     echo -e "${BLUE}================================================================${PLAIN}"
     echo -n "请输入选项: "
@@ -1173,8 +1235,8 @@ show_menu() {
         5) optimize_access ;;
         6) maintenance_tasks ;;
         7) manual_tasks_menu ;;
+        9) optimize_logging_killer ;;
         8) uninstall_syspro ;;
-        9) chattr -i /etc/resolv.conf; log_success "DNS 文件已解锁。" ;;
         0)
             optimize_disk_io
             optimize_compute
@@ -1183,11 +1245,10 @@ show_menu() {
             optimize_security
             optimize_access
             maintenance_tasks
-            echo -e "\n${GREEN}SysPro 全套优化已完成！${PLAIN}"
+            echo -e "\n${GREEN}SysPro 标准优化已完成！${PLAIN}"
+            echo -e "${YELLOW}提示: 如需极致网速/IO体验，请手动执行选项 [9] 彻底抹杀日志。${PLAIN}"
             ;;
         q) exit 0 ;;
         *) log_err "无效输入，请重新选择。" ;;
     esac
 }
-
-while true; do show_menu; echo -n "按回车键继续..."; read; done
