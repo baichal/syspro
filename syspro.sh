@@ -1252,3 +1252,5 @@ show_menu() {
         *) log_err "无效输入，请重新选择。" ;;
     esac
 }
+
+while true; do show_menu; echo -n "按回车键继续..."; read; done
