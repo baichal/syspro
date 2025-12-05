@@ -190,10 +190,10 @@ EOF
 #   模块 2: 算力与调度 (Compute & Latency)
 # ==============================================================================
 optimize_compute() {
-    log_info "正在优化 CPU 调度器与电源管理 (极速响应模式)..."
+    log_info "正在优化 CPU 调度器与电源管理 (网络高吞吐/BBR 适配模式)..."
 
     # --- 2.1 熵池补充 (Haveged) ---
-    # 5.6 以下内核补充熵池，避免加密握手卡顿
+    # 5.6 以下内核补充熵池，避免加密握手(TLS/SSL)卡顿
     KERNEL_MAJOR=$(uname -r | cut -d. -f1)
     KERNEL_MINOR=$(uname -r | cut -d. -f2)
     
@@ -208,37 +208,39 @@ optimize_compute() {
         fi
     fi
 
-    # --- 2.2 内核调度器微调 (CFS Micro-Tuning) ---
-    # Linux 默认调度器倾向于让任务跑久一点以增加吞吐量(Throughput)。
-    # 对于低延迟场景，需要让调度器更频繁地检查任务队列，以便网卡中断能抢占 CPU。
+    # --- 2.2 内核调度器参数重写 (CFS Tuning) ---
+    # [核心修改说明]
+    # 原参数 (3ms latency) 导致 Context Switch 过高，网络吞吐量上不去。
+    # 新参数 (15ms latency) 牺牲微秒级响应，换取更高的数据包处理能力 (PPS)。
     
     cat > /etc/sysctl.d/97-syspro-latency.conf << EOF
 # 调度延迟周期 (Scheduler Latency)
-# 定义任务队列轮询的周期。默认通常是 24ms。
-# 改为 3ms: 让 CPU 更频繁地检查是否有新任务(如网络包)到来。
-kernel.sched_latency_ns = 3000000
+# 默认: 24ms | 原脚本: 3ms (桌面级) | 优化后: 15ms (网络服务器级)
+# 作用: 增加每个任务在 CPU 上的运行时间片，减少切换开销，提升 BBR 吞吐。
+kernel.sched_latency_ns = 15000000
 
 # 唤醒粒度 (Wakeup Granularity)
-# 定义任务抢占的最小时间片。默认通常是 4ms。
-# 改为 0.5ms (500us): 有高优先级任务(如软中断)到来时，当前任务会更快让路。
-kernel.sched_wakeup_granularity_ns = 500000
+# 原脚本: 0.5ms | 优化后: 2ms
+# 作用: 避免新唤醒的进程(如瞬间的网络中断)过于频繁地抢占正在处理数据的进程。
+kernel.sched_wakeup_granularity_ns = 2000000
+kernel.sched_min_granularity_ns = 2000000
 
 # 迁移成本 (Migration Cost)
-# 降低任务在不同 CPU 核心间迁移的预估成本，允许任务寻找空闲核心。
-kernel.sched_migration_cost_ns = 250000
+# 原脚本: 0.25ms | 优化后: 0.5ms
+# 作用: 告诉内核“移动任务到另一个核心的代价很高”，
+# 这会鼓励内核让网络中断处理程序留在同一个核心上，利用 L1/L2 缓存加速数据包处理。
+kernel.sched_migration_cost_ns = 500000
 
 # 禁用 RT 节流 (Realtime Throttling)
-# 防止处理网络包的实时进程(Realtime)占用 CPU 时间过长被内核掐断。
-# 设置为 -1 表示禁用限制，允许进程使用 CPU。
+# 防止高负载下，内核强制掐断处理网络包的实时进程(Realtime Process)。
+# 设置为 -1 表示禁用限制，允许进程使用 100% CPU。
 kernel.sched_rt_runtime_us = -1
 EOF
     sysctl -p /etc/sysctl.d/97-syspro-latency.conf >/dev/null 2>&1
-    log_success "内核 CFS 调度器已优化。"
+    log_success "内核 CFS 调度器已优化 (Throughput Optimized / 15ms)。"
 
     # --- 2.3 CPU 模式锁定与 C-State 禁用 ---
-    # 现代 CPU 空闲时会进入 C-States (深度睡眠)。
-    # 从睡眠唤醒到工作状态需要几十微秒，导致 Ping 值抖动。
-    # 目标是: 让 CPU 保持工作状态 (Always On)。
+    # 目标: 锁定 Performance 模式，减少 CPU 变频带来的延迟
     
     IS_VIRTUAL="false"
     if command -v systemd-detect-virt >/dev/null 2>&1; then
@@ -265,20 +267,13 @@ EOF
             # A. 锁定 Performance 频率 (P-State): 保持最高主频
             cpupower frequency-set -g performance >/dev/null 2>&1
             
-            # B. 禁用 C-States (Idle State): 减少睡眠
-            # 获取当前 CPU 支持的 idle 状态数量
-            IDLE_STATES=$(cpupower idle-info 2>/dev/null | grep "Number of idle states:" | awk '{print $NF}')
-            
-            if [ -n "$IDLE_STATES" ] && [ "$IDLE_STATES" -gt 1 ]; then
-                # 禁用 State 1 及以上的深度睡眠状态 (仅保留 State 0 - POLL)
-                # 这会增加功耗，但能减少唤醒延迟
-                cpupower idle-set -D 1 >/dev/null 2>&1
-                log_success "CPU 频率已锁定，且已禁用深度睡眠。"
-            else
-                log_success "CPU 频率已锁定。"
-            fi
+            # B. 禁用 C-States (Idle State)
+            # [修改] 只禁用 C2 及以上的深度睡眠，保留 C0/C1。
+            # 完全禁用(如 -D 1)可能导致 CPU 在空闲时过热降频，保留 C1 可平衡发热与响应。
+            cpupower idle-set -D 2 >/dev/null 2>&1
+            log_success "CPU 频率已锁定 (Performance)，已禁用深度睡眠 (C2+)。"
         else
-            # C. 回退方案: 直接修改 Sysfs (如果 cpupower 安装失败)
+            # C. 回退方案: 直接修改 Sysfs
             local success_count=0
             for cpu_gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
                 if [ -w "$cpu_gov" ]; then
@@ -298,13 +293,13 @@ EOF
 #   模块 3-1: Systemd 全局配置与进程保护
 # ==============================================================================
 optimize_systemd() {
-    log_info "优化 Systemd 与削减系统开销..."
+    log_info "优化 Systemd 全局配置与削减系统开销..."
     
-    # --- 3.0 禁用 Auditd (审计服务) ---
-    # Auditd 会 Hook 每一个系统调用(Syscall)来记录日志。
-    # 在高并发网络下，这会拖慢系统调用的返回速度。关闭它能减少内核路径开销。
+    # --- 3.0 禁用 Auditd (审计服务) [新增关键步骤] ---
+    # 原因: Auditd 会 Hook 每一个系统调用(Syscall)来记录日志。
+    # 在高并发网络下(如脚本2跑分时)，这会极大拖慢 Socket 读写速度。
     if systemctl is-active auditd >/dev/null 2>&1; then
-        log_info "正在禁用 auditd 审计服务 (减少系统调用开销)..."
+        log_info "正在禁用 auditd 审计服务 (消除 Syscall 钩子延迟)..."
         systemctl stop auditd
         systemctl disable auditd
         
@@ -313,13 +308,20 @@ optimize_systemd() {
         if [ ! -f /etc/sysctl.d/96-no-audit.conf ]; then
              echo "kernel.printk = 3 4 1 3" > /etc/sysctl.d/96-no-audit.conf
         fi
-        log_success "Auditd 服务已禁用。"
+        log_success "Auditd 服务已禁用 (性能提升)。"
     fi
     
-    # --- 3.1 Systemd 超时优化 ---
-    # 减少关机等待时间
+    # --- 3.1 Systemd 全局 Limits 优化 [新增] ---
+    # 原脚本未修改此处。为了配合脚本2，必须先在 Systemd 层放开限制。
     [ ! -f /etc/systemd/system.conf.syspro.bak ] && cp /etc/systemd/system.conf /etc/systemd/system.conf.syspro.bak
-    sed -i -e 's/^#\?DefaultTimeoutStopSec=.*/DefaultTimeoutStopSec=10s/' /etc/systemd/system.conf
+    
+    # 减少关机等待时间
+    sed -i -e 's/^#\?DefaultTimeoutStopSec=.*/DefaultTimeoutStopSec=5s/' /etc/systemd/system.conf
+    
+    # [修改] 预先将 Systemd 全局句柄限制拉满到 100万
+    sed -i 's/^#\?DefaultLimitNOFILE=.*/DefaultLimitNOFILE=1000000/' /etc/systemd/system.conf
+    sed -i 's/^#\?DefaultLimitNPROC=.*/DefaultLimitNPROC=1000000/' /etc/systemd/system.conf
+    
     systemctl daemon-reload
     
     # --- 3.2 禁用 Core Dump ---
@@ -349,14 +351,14 @@ EOF
     apply_oom_protect "sshd" "-1000"
     apply_oom_protect "systemd-journald" "-500"
     
-    # 清理旧版脚本
+    # 清理旧版脚本残留
     if [ -f /usr/local/bin/oom-protect.sh ]; then
         rm -f /usr/local/bin/oom-protect.sh
         crontab -l 2>/dev/null | grep -v "oom-protect" | crontab -
     fi
 
     systemctl daemon-reload
-    log_success "进程保护与开销优化完成。"
+    log_success "进程保护与 Systemd 开销优化完成。"
 }
 
 # ==============================================================================
@@ -366,71 +368,77 @@ EOF
 #     2. Swappiness 降为 10，优先使用物理内存，减少 CPU 上下文切换。
 # ==============================================================================
 optimize_memory() {
-    log_info "正在优化内存结构 (ZRAM & Swap)..."
+    log_info "正在优化内存结构 (ZRAM 网络适配版)..."
 
-    # --- 3.4 ZRAM 内存压缩 ---
+    # --- 3.4 ZRAM 内存压缩 [逻辑重写] ---
+    # 获取物理内存大小 (MB)
+    MEM_TOTAL_MB=$(free -m | awk '/Mem:/ {print $2}')
     HAS_ZRAM=0
     
     if modinfo zram >/dev/null 2>&1; then
-        # 尝试加载模块
-        if modprobe zram num_devices=1; then
-            
-            # 等待设备节点就绪
-            if command -v udevadm >/dev/null 2>&1; then
-                udevadm settle --timeout=5
-            else
-                sleep 0.5
+        # [判断1] 如果物理内存充足 (>4GB)，则禁用 ZRAM。
+        # 原因: 脚本2运行 BBR 需要大量 CPU 进行拥塞计算。ZRAM 的压缩/解压会抢占 CPU 资源。
+        # 只有在内存不足导致 Swap 频繁时，ZRAM 才划算。
+        if [ "$MEM_TOTAL_MB" -gt 4096 ]; then
+            log_info "检测到大内存环境 (>4GB)，跳过/禁用 ZRAM 以释放 CPU 算力。"
+            # 如果之前启用过，这里关闭它
+            if systemctl is-active zram >/dev/null 2>&1; then
+                systemctl disable --now zram >/dev/null 2>&1
             fi
+            HAS_ZRAM=0
+        else
+            # [判断2] 内存 < 4GB，启用 ZRAM，但强制优化算法
+            log_info "检测到小内存环境，准备启用轻量化 ZRAM..."
+            
+            # 尝试加载模块
+            if modprobe zram num_devices=1; then
+                
+                # 等待设备节点就绪
+                if command -v udevadm >/dev/null 2>&1; then udevadm settle --timeout=5; else sleep 0.5; fi
 
-            # 检查是否已启用
-            if ! grep -q "zram" /proc/swaps; then
-                log_info "配置 ZRAM..."
-                
-                # 动态计算 ZRAM 大小
-                # 仅占用物理内存的 20%，且最大不超过 1024MB。
-                # 将 80% 以上的物理内存留给 nftx2 进行 TCP BDP 缓冲。
-                MEM_TOTAL_MB=$(free -m | awk '/Mem:/ {print $2}')
-                
-                # 计算 20%
-                ZRAM_SIZE=$(($MEM_TOTAL_MB / 5))
-                
-                # 限制最大值 1GB
-                if [ "$ZRAM_SIZE" -gt 1024 ]; then
-                    ZRAM_SIZE=1024
-                fi
-                # 限制最小值 128MB (如果内存太小，给少了没意义)
-                if [ "$ZRAM_SIZE" -lt 128 ]; then
-                    ZRAM_SIZE=128
-                fi
-                
-                # 算法选择: 优先 zstd (压缩比高), 其次 lzo (速度快)
-                ALGO="lzo"
-                if [ -f /sys/block/zram0/comp_algorithm ]; then
-                    local avail_algos=$(cat /sys/block/zram0/comp_algorithm)
-                    if [[ "$avail_algos" == *"zstd"* ]]; then
-                        ALGO="zstd"
+                # 检查是否已启用
+                if ! grep -q "zram" /proc/swaps; then
+                    
+                    # 计算 ZRAM 大小: 
+                    # 仅占用物理内存的 20%，避免侵占 TCP 发送/接收缓冲区。
+                    ZRAM_SIZE=$(($MEM_TOTAL_MB / 5))
+                    
+                    # 限制范围 [128MB, 1024MB]
+                    if [ "$ZRAM_SIZE" -gt 1024 ]; then ZRAM_SIZE=1024; fi
+                    if [ "$ZRAM_SIZE" -lt 128 ]; then ZRAM_SIZE=128; fi
+                    
+                    # [算法修改] 强制优先使用 lz4。
+                    # 原脚本优先 zstd (高压缩比)。改为 lz4 (极低 CPU 占用)，为网络栈让路。
+                    ALGO="lzo"
+                    if [ -f /sys/block/zram0/comp_algorithm ]; then
+                        local avail_algos=$(cat /sys/block/zram0/comp_algorithm)
+                        if [[ "$avail_algos" == *"lz4"* ]]; then
+                            ALGO="lz4"
+                        elif [[ "$avail_algos" == *"zstd"* ]]; then
+                            ALGO="zstd"
+                        fi
                     fi
-                fi
 
-                # 生成启动脚本
-                cat > /usr/local/bin/zram-start.sh <<EOF
+                    # 生成启动脚本
+                    cat > /usr/local/bin/zram-start.sh <<EOF
 #!/bin/bash
 modprobe zram num_devices=1
 sleep 0.5
 # 重置设备 (如果存在)
 [ -f /sys/block/zram0/reset ] && echo 1 > /sys/block/zram0/reset 2>/dev/null
-# 设置参数
+# 设置算法
 echo "$ALGO" > /sys/block/zram0/comp_algorithm 2>/dev/null
+# 设置参数
 echo "${ZRAM_SIZE}M" > /sys/block/zram0/disksize
 # 格式化与启用
 mkswap /dev/zram0 >/dev/null 2>&1
-# 优先级 100 (高于磁盘 Swap)
+# 优先级 100
 swapon -p 100 /dev/zram0
 EOF
-                chmod +x /usr/local/bin/zram-start.sh
-                
-                # Systemd Service 封装
-                cat > /etc/systemd/system/zram.service <<EOF
+                    chmod +x /usr/local/bin/zram-start.sh
+                    
+                    # Systemd Service 封装
+                    cat > /etc/systemd/system/zram.service <<EOF
 [Unit]
 Description=SysPro Lightweight ZRAM
 After=multi-user.target
@@ -441,29 +449,30 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-                systemctl daemon-reload
-                systemctl enable zram --now >/dev/null 2>&1
-                
-                # 验证状态
-                sleep 1
-                if grep -q "zram" /proc/swaps; then
-                    log_success "ZRAM 已启用 (大小: ${ZRAM_SIZE}MB, 算法: ${ALGO}) - 已限制大小以避让网络缓冲。"
-                    HAS_ZRAM=1
+                    systemctl daemon-reload
+                    systemctl enable zram --now >/dev/null 2>&1
+                    
+                    # 验证状态
+                    sleep 1
+                    if grep -q "zram" /proc/swaps; then
+                        log_success "ZRAM 已启用 (大小: ${ZRAM_SIZE}MB, 算法: ${ALGO}) - CPU 占用已优化。"
+                        HAS_ZRAM=1
+                    else
+                        log_err "ZRAM 启动失败，可能受限于 VPS 虚拟化架构。"
+                    fi
                 else
-                    log_err "ZRAM 启动失败，可能受限于 VPS 虚拟化架构。"
+                    log_info "ZRAM 已经处于启用状态，跳过配置。"
+                    HAS_ZRAM=1
                 fi
             else
-                log_info "ZRAM 已经处于启用状态，跳过配置。"
-                HAS_ZRAM=1
+                log_warn "加载 zram 模块失败，跳过。"
             fi
-        else
-            log_warn "加载 zram 模块失败，跳过。"
         fi
     else
         log_warn "当前内核缺少 zram 模块，跳过。"
     fi
     
-    # --- 3.5 Swappiness 优化 (协同 nftx2) ---
+    # --- 3.5 Swappiness 优化 ---
     
     # 检测 nftx2 是否存在
     NFTX2_EXISTS=0
@@ -472,14 +481,13 @@ EOF
         log_warn "检测到 nftx2 网络优化套件..."
     fi
     
-    # 强制低 Swappiness
-    # 无论是否有 ZRAM，作为跑流量的机器，应尽量避免内存换页造成的延迟。
-    # 设置为 10: 只有当物理内存剩下 10% 时才开始动用 Swap。
+    # [修改] 强制 vm.swappiness = 10
+    # 无论是为了省内存还是为了速度，对于网络转发服务器，物理内存也是缓存。
+    # 避免不必要的 Swap 换页造成的数百毫秒延迟。
     sysctl -w vm.swappiness=10 >/dev/null 2>&1
     
     if [ "$NFTX2_EXISTS" -eq 0 ]; then
         # 只有在没有 nftx2 的情况下，syspro 才持久化这个参数
-        # 如果有 nftx2，把控制权交给 nftx2 (nftx2 会根据情况动态调整)
         echo "vm.swappiness = 10" > /etc/sysctl.d/99-syspro-swap.conf
         log_info "  - 已设置 Swappiness = 10 (物理内存优先，降低延迟)。"
     else
@@ -487,17 +495,24 @@ EOF
     fi
     
     # --- 3.6 保底磁盘 Swap ---
-    # 只有当系统完全没有 Swap 时，才创建小文件作为防崩溃保险
+    # 只有当系统完全没有 Swap 且内存极小 (<8GB) 时，才创建。
+    # 如果是 16GB 以上的机器，没有 Swap 也完全没问题。
     CURRENT_SWAP_MB=$(free -m | awk '/Swap:/ {print $2}')
     
-    if [ "$CURRENT_SWAP_MB" -ge 512 ]; then
+    if [ "$CURRENT_SWAP_MB" -ge 128 ]; then
         log_info "系统已有 Swap (${CURRENT_SWAP_MB}MB)，无需额外创建。"
+        return
+    fi
+    
+    # [新增] 大内存跳过逻辑
+    if [ "$MEM_TOTAL_MB" -gt 8192 ]; then
+        log_info "物理内存充足 (>8GB)，跳过保底 Swap 创建。"
         return
     fi
     
     log_warn "系统无 Swap 且 ZRAM 未生效，正在创建保底 Swap (/swapfile)..."
     
-    # 固定为 1GB，不做动态计算，避免占用太多磁盘
+    # 固定为 1GB
     SIZE=1024
     
     # 检查磁盘空间 (至少留 2GB 给系统)
