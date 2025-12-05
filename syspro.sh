@@ -232,9 +232,9 @@ kernel.sched_min_granularity_ns = 2000000
 kernel.sched_migration_cost_ns = 500000
 
 # 禁用 RT 节流 (Realtime Throttling)
-# 防止高负载下，内核强制掐断处理网络包的实时进程(Realtime Process)。
-# 设置为 -1 表示禁用限制，允许进程使用 100% CPU。
-kernel.sched_rt_runtime_us = -1
+# 设置为 950000 (保留 5% CPU 给系统保活进程)，防止 Watchdog 在极端死循环下无法唤醒。
+# 原设置为 -1 (完全禁用) 在极少数单核机器上可能导致死机。
+kernel.sched_rt_runtime_us = 950000
 EOF
     sysctl -p /etc/sysctl.d/97-syspro-latency.conf >/dev/null 2>&1
     log_success "内核 CFS 调度器已优化 (Throughput Optimized / 15ms)。"
