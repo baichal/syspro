@@ -1109,134 +1109,115 @@ EOF
 uninstall_syspro() {
     echo -e "${RED}警告: 正在卸载 SysPro 及所有扩展组件...${PLAIN}"
     
-    # --- 检查是否存在日志被禁用的标记 ---
+    # --- 1. 恢复日志系统 (如果曾被脚本9号选项彻底禁用) ---
     if [ -f "/etc/syspro_logs_killed" ]; then
-        log_info "检测到日志系统曾被禁用 (/etc/syspro_logs_killed)，正在执行恢复操作..."
+        log_info "检测到日志系统曾被禁用，正在执行恢复操作..."
         
-        # 恢复步骤 1: 解锁文件属性 (chattr -i)
-        # 如果不先做这一步，后续的 chmod 和 rm 都会提示 "Operation not permitted"
-        log_info "  - 解锁文件系统不可变属性..."
+        # 解锁文件系统不可变属性 (chattr -i)
         if command -v chattr >/dev/null 2>&1; then
             chattr -R -i /var/log 2>/dev/null
         fi
         
-        # 恢复步骤 2: 恢复目录写权限
-        # 恢复为标准的 755 (rwxr-xr-x)
+        # 恢复目录权限为标准的 755
         chmod -R 755 /var/log
         
-        # 恢复步骤 3: 移除内核静音配置
+        # 移除内核静音配置
         rm -f /etc/sysctl.d/95-syspro-silence.conf
         
-        # 恢复步骤 4: 恢复 Journald 配置文件
-        # 删除之前写入的不记录日志配置
-        rm -f /etc/systemd/journald.conf
-        
-        # 如果配置文件被删没了，尝试写入一个标准的默认值，防止服务报错
-        if [ ! -f /etc/systemd/journald.conf ]; then
-             echo "[Journal]" > /etc/systemd/journald.conf
-             echo "Storage=auto" >> /etc/systemd/journald.conf
-             # 限制日志大小，防止恢复后日志瞬间撑爆硬盘
-             echo "SystemMaxUse=200M" >> /etc/systemd/journald.conf
+        # 恢复 Journald 配置 (如果被删空，写入默认值)
+        if [ ! -f /etc/systemd/journald.conf ] || [ ! -s /etc/systemd/journald.conf ]; then
+             echo -e "[Journal]\nStorage=auto\nSystemMaxUse=200M" > /etc/systemd/journald.conf
         fi
         
-        # 恢复步骤 5: 解除服务屏蔽 (Unmask) 并重启
-        local SERVICES=("rsyslog" "systemd-journald" "syslog" "kdump")
+        # 解除服务屏蔽 (Unmask) 并重启
+        local SERVICES=("rsyslog" "systemd-journald" "syslog" "kdump" "auditd" "avahi-daemon")
         for svc in "${SERVICES[@]}"; do
-            # Unmask: 移除指向 /dev/null 的软链接
             systemctl unmask "$svc" 2>/dev/null
-            # Enable: 设置开机自启
             systemctl enable "$svc" 2>/dev/null
-            # Restart: 立即启动
             systemctl restart "$svc" 2>/dev/null
         done
         
-        # 恢复步骤 6: 删除标记文件
+        # 删除标记文件
         rm -f /etc/syspro_logs_killed
-        log_success "日志系统功能已恢复，服务已重启。"
-    else
-        log_info "日志系统未被深度修改，无需执行恢复流程。"
+        log_success "日志系统功能已恢复。"
     fi
 
-    # --- 以下是常规组件的卸载逻辑 ---
-    
+    # --- 2. 清理常规组件 ---
     log_info "正在清理 DNS 与网络组件..."
-    # 1. 解锁并重置 resolv.conf (必须先 chattr -i)
+    
+    # 恢复 DNS
     chattr -i /etc/resolv.conf >/dev/null 2>&1
     rm -f /etc/resolv.conf
-    # 恢复为 Google/Cloudflare 公共 DNS
     echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
     
-    # 2. 停止并清理 DoH 和 ZRAM 服务
+    # 停止服务
     systemctl disable --now syspro-doh zram >/dev/null 2>&1
     rm -f /etc/systemd/system/syspro-doh.service
     rm -f /etc/systemd/system/zram.service
     
-    # 3. 删除二进制文件与脚本
+    # 删除文件
     rm -f /usr/local/bin/cloudflared 
     rm -f /usr/local/bin/zram-start.sh
     
-    # 4. 清理内核参数 (Sysctl)
+    # 清理内核参数 (包括新增的 Auditd 屏蔽和 调度优化)
     log_info "正在清理内核优化参数..."
     rm -f /etc/sysctl.d/97-syspro-latency.conf
     rm -f /etc/sysctl.d/99-syspro-swap.conf
     rm -f /etc/sysctl.d/98-syspro-security.conf
     rm -f /etc/sysctl.d/96-no-audit.conf
     
-    # 5. 清理 Swap 文件与 Fstab 挂载
+    # 清理 Swap 与 Fstab
     if [ -f "/swapfile" ]; then 
         swapoff /swapfile 2>/dev/null
         rm -f /swapfile
-        log_info "  - 已删除 /swapfile"
     fi
-    # 还原 fstab (去除 noatime 等)
     if [ -f /etc/fstab.syspro.bak ]; then 
         cp /etc/fstab.syspro.bak /etc/fstab
-        # 重新挂载根目录使参数生效
         mount -o remount / 2>/dev/null
     fi
     
-    # 6. 清理 Udev 规则 (IO调度)
+    # 清理 Udev 规则
     rm -f /etc/udev/rules.d/60-io-scheduler.rules
     if command -v udevadm >/dev/null 2>&1; then 
         udevadm control --reload && udevadm trigger
     fi
     
-    # 7. 清理 Systemd 全局配置与 OOM 保护
+    # 清理 Systemd 配置
     rm -rf /etc/systemd/system/ssh.service.d
+    rm -rf /etc/systemd/system/sshd.service.d
     rm -f /etc/security/limits.d/99-disable-core.conf
+    
+    # 还原 Systemd 全局文件 (恢复默认句柄限制)
     if [ -f /etc/systemd/system.conf.syspro.bak ]; then
         cp /etc/systemd/system.conf.syspro.bak /etc/systemd/system.conf
     fi
     
-    # 8. 刷新系统状态
+    # 刷新状态
     systemctl daemon-reload
     sysctl --system >/dev/null 2>&1
     
     echo ""
     echo -e "${GREEN}SysPro 已成功完全卸载。${PLAIN}"
-    echo -e "${YELLOW}提示: 建议重启服务器 (reboot) 以彻底重置内核状态。${PLAIN}"
+    echo -e "${YELLOW}提示: 建议重启服务器 (reboot) 以彻底重置 CPU 调度器和内存状态。${PLAIN}"
 }
 
-# ==============================================================================
-#   主菜单
-# ==============================================================================
 show_menu() {
     clear
     echo -e "${BLUE}================================================================${PLAIN}"
-    echo -e "${GREEN}    SysPro v5.4 - Infrastructure Configuration   ${PLAIN}"
+    echo -e "${GREEN}    SysPro High Performance Network Edition   ${PLAIN}"
     echo -e "${BLUE}================================================================${PLAIN}"
     echo -e " 1. ${GREEN}I/O 优化${PLAIN}   (Noatime, Udev 调度)"
-    echo -e " 2. ${GREEN}CPU 与熵池${PLAIN}      (CPU Performance, Haveged)"
-    echo -e " 3. ${GREEN}进程与内存${PLAIN}      (Systemd 配置, ZRAM, Btrfs Swap)"
+    echo -e " 2. ${GREEN}CPU 与熵池${PLAIN}      (15ms 调度周期, BBR 适配)"
+    echo -e " 3. ${GREEN}进程与内存${PLAIN}      (禁用 Auditd, 智能 ZRAM, 文件句柄)"
     echo -e " 4. ${GREEN}安全配置${PLAIN}        (隐藏内核地址, dmesg 限制)"
     echo -e " 5. ${GREEN}接入与 DNS${PLAIN}      (SSH 配置, DoH/UDP 双模)"
     echo -e " 6. ${GREEN}维护与清理${PLAIN}      (常用工具, 时区, 缓存清理)"
     echo -e " 7. ${YELLOW}手动管理工具${PLAIN}    (卸载内核 / 安装其他 BBR)"
     echo -e "${BLUE}----------------------------------------------------------------${PLAIN}"
-    echo -e " 9. ${RED}关闭日志系统${PLAIN}    (减少 IO)"
+    echo -e " 9. ${RED}关闭日志系统${PLAIN}    (极速模式：彻底抹杀日志进程，降低 IO)"
     echo -e "${BLUE}----------------------------------------------------------------${PLAIN}"
-    echo -e " 0. ${GREEN}一键执行所有优化${PLAIN}    (执行 1-6)"
-    echo -e " 8. ${RED}卸载/还原${PLAIN}       (还原优化，支持恢复日志)"
+    echo -e " 0. ${GREEN}一键执行所有优化${PLAIN}    (推荐: 先运行此项，重启后再跑 nftx2)"
+    echo -e " 8. ${RED}卸载/还原${PLAIN}       (还原系统默认状态)"
     echo -e " q. 退出"
     echo -e "${BLUE}================================================================${PLAIN}"
     echo -n "请输入选项: "
@@ -1260,8 +1241,9 @@ show_menu() {
             optimize_security
             optimize_access
             maintenance_tasks
-            echo -e "\n${GREEN}SysPro 标准优化已完成！${PLAIN}"
-            echo -e "${YELLOW}提示: 如需极致网速/IO体验，请手动执行选项 [9] 彻底抹杀日志。${PLAIN}"
+            echo -e "\n${GREEN}SysPro 基础优化已完成！${PLAIN}"
+            echo -e "${YELLOW}建议: 1. 重启服务器 (reboot)。${PLAIN}"
+            echo -e "${YELLOW}      2. 运行脚本 2 (nftx2) 进行网络协议栈调优。${PLAIN}"
             ;;
         q) exit 0 ;;
         *) log_err "无效输入，请重新选择。" ;;
