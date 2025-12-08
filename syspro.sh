@@ -1104,32 +1104,39 @@ EOF
 }
 
 # ==============================================================================
-#   模块 9: 卸载 SysPro
+#   模块 9: 卸载 SysPro (Docker 修复增强版)
+#   说明: 包含日志恢复、网络栈重置、DNS 软链接重建及 Docker 缓存刷新
 # ==============================================================================
 uninstall_syspro() {
     echo -e "${RED}警告: 正在卸载 SysPro 及所有扩展组件...${PLAIN}"
     
-    # --- 1. 恢复日志系统 (如果曾被脚本9号选项彻底禁用) ---
+    # --------------------------------------------------------------------------
+    # 1. 恢复日志系统 (如果曾被脚本9号选项“日志杀手”彻底禁用)
+    # --------------------------------------------------------------------------
     if [ -f "/etc/syspro_logs_killed" ]; then
         log_info "检测到日志系统曾被禁用，正在执行恢复操作..."
         
-        # 解锁文件系统不可变属性 (chattr -i)
+        # 1.1 解锁文件系统不可变属性 (chattr -i)
+        # 之前为了防止日志写入锁定了 /var/log，现在必须解锁才能删除或写入
         if command -v chattr >/dev/null 2>&1; then
             chattr -R -i /var/log 2>/dev/null
         fi
         
-        # 恢复目录权限为标准的 755
+        # 1.2 恢复目录权限
+        # 之前改为 555 (只读)，恢复为标准的 755
         chmod -R 755 /var/log
         
-        # 移除内核静音配置
+        # 1.3 移除内核静音配置 (恢复控制台报错显示)
         rm -f /etc/sysctl.d/95-syspro-silence.conf
         
-        # 恢复 Journald 配置 (如果被删空，写入默认值)
+        # 1.4 恢复 Journald 配置
+        # 如果配置文件被清空或不存在，写入标准的默认配置
         if [ ! -f /etc/systemd/journald.conf ] || [ ! -s /etc/systemd/journald.conf ]; then
              echo -e "[Journal]\nStorage=auto\nSystemMaxUse=200M" > /etc/systemd/journald.conf
         fi
         
-        # 解除服务屏蔽 (Unmask) 并重启
+        # 1.5 解除服务屏蔽 (Unmask) 并重启
+        # 恢复 rsyslog, journald, auditd 等基础服务
         local SERVICES=("rsyslog" "systemd-journald" "syslog" "kdump" "auditd" "avahi-daemon")
         for svc in "${SERVICES[@]}"; do
             systemctl unmask "$svc" 2>/dev/null
@@ -1137,62 +1144,114 @@ uninstall_syspro() {
             systemctl restart "$svc" 2>/dev/null
         done
         
-        # 删除标记文件
+        # 1.6 删除状态标记文件
         rm -f /etc/syspro_logs_killed
         log_success "日志系统功能已恢复。"
     fi
 
-    # --- 2. 清理常规组件 ---
-    log_info "正在清理 DNS 与网络组件..."
+    # --------------------------------------------------------------------------
+    # 2. 清理网络组件与修复 DNS (核心：解决 Docker 断网问题)
+    # --------------------------------------------------------------------------
+    log_info "正在清理网络组件并恢复系统默认 DNS..."
     
-    # 恢复 DNS
-    chattr -i /etc/resolv.conf >/dev/null 2>&1
-    rm -f /etc/resolv.conf
-    echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
-    
-    # 停止服务
-    systemctl disable --now syspro-doh zram >/dev/null 2>&1
+    # 2.1 停止并删除 DoH 客户端 (Cloudflared)
+    systemctl disable --now syspro-doh >/dev/null 2>&1
     rm -f /etc/systemd/system/syspro-doh.service
-    rm -f /etc/systemd/system/zram.service
-    
-    # 删除文件
     rm -f /usr/local/bin/cloudflared 
+    
+    # 2.2 恢复 /etc/resolv.conf 结构
+    # [关键点] Docker 依赖宿主机的 resolv.conf。如果宿主机使用 systemd-resolved，
+    # resolv.conf 必须是一个指向 /run/systemd/... 的软链接，否则 Docker 容器内 DNS 会出错。
+    
+    # 先解锁文件，防止因 chattr +i 导致无法修改
+    if command -v chattr >/dev/null 2>&1; then chattr -i /etc/resolv.conf 2>/dev/null; fi
+    
+    # 检测系统是否支持 systemd-resolved (Debian 10+, Ubuntu 18.04+, CentOS 9)
+    if systemctl list-unit-files | grep -q "systemd-resolved"; then
+        log_info "检测到 systemd-resolved 环境，正在重建标准软链接..."
+        
+        # 恢复服务状态
+        systemctl unmask systemd-resolved 2>/dev/null
+        systemctl enable systemd-resolved 2>/dev/null
+        systemctl restart systemd-resolved 2>/dev/null
+        
+        # 强制重建软链接 (这是修复 Docker 的关键步骤)
+        # 如果 /run/... 下的存根文件存在，则建立链接
+        if [ -f /run/systemd/resolve/stub-resolv.conf ]; then
+            rm -f /etc/resolv.conf
+            ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+            log_success "/etc/resolv.conf 已恢复为系统标准软链接。"
+        else
+            # 备选方案：如果找不到存根文件，回退到静态 Google DNS
+            rm -f /etc/resolv.conf
+            echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/resolv.conf
+            log_warn "未找到 systemd-resolved 存根，已回退为静态 DNS 配置。"
+        fi
+    else
+        # 适用于 CentOS 7 或不使用 systemd-resolved 的老系统
+        rm -f /etc/resolv.conf
+        echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/resolv.conf
+        log_success "DNS 已重置为公共 DNS (无 systemd-resolved)。"
+    fi
+
+    # 2.3 强制重启 Docker 服务
+    # [关键点] 修改 resolv.conf 后，必须重启 Docker 守护进程，
+    # 否则容器启动时仍会使用旧的缓存配置或 Google 默认 DNS。
+    if systemctl is-active docker >/dev/null 2>&1; then
+        log_info "正在重启 Docker 服务以刷新网络配置..."
+        systemctl restart docker
+        log_success "Docker 服务已重启，容器 DNS 应已恢复正常。"
+    fi
+
+    # --------------------------------------------------------------------------
+    # 3. 清理常规优化组件
+    # --------------------------------------------------------------------------
+    
+    # 3.1 移除 ZRAM 内存压缩
+    if systemctl is-active zram >/dev/null 2>&1; then
+        systemctl disable --now zram >/dev/null 2>&1
+    fi
+    rm -f /etc/systemd/system/zram.service
     rm -f /usr/local/bin/zram-start.sh
     
-    # 清理内核参数 (包括新增的 Auditd 屏蔽和 调度优化)
+    # 3.2 清理内核参数 (Sysctl)
     log_info "正在清理内核优化参数..."
-    rm -f /etc/sysctl.d/97-syspro-latency.conf
-    rm -f /etc/sysctl.d/99-syspro-swap.conf
-    rm -f /etc/sysctl.d/98-syspro-security.conf
-    rm -f /etc/sysctl.d/96-no-audit.conf
+    rm -f /etc/sysctl.d/97-syspro-latency.conf  # 调度器
+    rm -f /etc/sysctl.d/99-syspro-swap.conf     # Swappiness
+    rm -f /etc/sysctl.d/98-syspro-security.conf # 安全参数
+    rm -f /etc/sysctl.d/96-no-audit.conf        # Auditd 屏蔽
     
-    # 清理 Swap 与 Fstab
+    # 3.3 清理 Swap 与 Fstab 挂载
     if [ -f "/swapfile" ]; then 
         swapoff /swapfile 2>/dev/null
         rm -f /swapfile
     fi
+    # 还原 /etc/fstab (移除 noatime)
     if [ -f /etc/fstab.syspro.bak ]; then 
         cp /etc/fstab.syspro.bak /etc/fstab
         mount -o remount / 2>/dev/null
+        rm -f /etc/fstab.syspro.bak
     fi
     
-    # 清理 Udev 规则
+    # 3.4 清理 Udev 磁盘调度规则
     rm -f /etc/udev/rules.d/60-io-scheduler.rules
     if command -v udevadm >/dev/null 2>&1; then 
         udevadm control --reload && udevadm trigger
     fi
     
-    # 清理 Systemd 配置
+    # 3.5 清理 Systemd 限制与 OOM 保护
     rm -rf /etc/systemd/system/ssh.service.d
     rm -rf /etc/systemd/system/sshd.service.d
     rm -f /etc/security/limits.d/99-disable-core.conf
     
-    # 还原 Systemd 全局文件 (恢复默认句柄限制)
+    # 还原 Systemd 全局文件 (恢复默认文件句柄限制)
     if [ -f /etc/systemd/system.conf.syspro.bak ]; then
         cp /etc/systemd/system.conf.syspro.bak /etc/systemd/system.conf
     fi
     
-    # 刷新状态
+    # --------------------------------------------------------------------------
+    # 4. 刷新系统状态
+    # --------------------------------------------------------------------------
     systemctl daemon-reload
     sysctl --system >/dev/null 2>&1
     
