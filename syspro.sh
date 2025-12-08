@@ -564,38 +564,28 @@ EOF
 }
 
 # ==============================================================================
-#   模块 5: 辅助函数 - Cloudflared 安装与启动
+#   模块 5: 辅助函数 - Cloudflared 安装与启动 (Docker 兼容增强版)
+#   功能: 部署 DoH 客户端，并自动配置 Docker 网络与防火墙安全规则
 # ==============================================================================
 install_cloudflared() {
-    log_info "开始部署 Cloudflared DoH 客户端..."
+    log_info "开始部署 Cloudflared DoH 客户端 (Docker 适配模式)..."
     
-    # 1. 架构判断与下载链接
+    # --- 1. 架构判断与下载链接 ---
     case $ARCH in
-        amd64)
-            URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64"
-            ;;
-        arm64)
-            URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
-            ;;
-        armhf)
-            URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm"
-            ;;
-        *)
-            log_err "Cloudflared 不支持当前架构: $ARCH ($RAW_ARCH)"
-            return 1
-            ;;
+        amd64) URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" ;;
+        arm64) URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64" ;;
+        armhf) URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm" ;;
+        *) log_err "Cloudflared 不支持当前架构: $ARCH ($RAW_ARCH)"; return 1 ;;
     esac
 
-    # 2. 下载二进制文件
-    log_info "正在从 GitHub 下载二进制文件 ($ARCH)..."
+    # --- 2. 下载二进制文件 ---
     if [ ! -f /usr/local/bin/cloudflared ]; then
-        # --connect-timeout 5: 连接超时5秒
-        # --max-time 60: 整个下载最长60秒
-        # --retry 2: 失败重试2次
+        log_info "正在从 GitHub 下载二进制文件 ($ARCH)..."
+        # 增加超时与重试机制，防止网络波动导致脚本卡死
         if curl -L --retry 2 --connect-timeout 5 --max-time 60 -o /usr/local/bin/cloudflared "$URL"; then
             chmod +x /usr/local/bin/cloudflared
         else
-            log_err "下载失败。请检查网络或配置代理。"
+            log_err "下载失败。请检查网络连接。"
             return 1
         fi
     else
@@ -603,17 +593,20 @@ install_cloudflared() {
         chmod +x /usr/local/bin/cloudflared
     fi
     
-    # 3. 创建专用用户 (安全性)
+    # --- 3. 创建专用用户 (安全性) ---
+    # 使用无登录权限的系统用户运行服务
     id -u cloudflared &>/dev/null || useradd -M -s /usr/sbin/nologin cloudflared
 
-    # 4. 构造启动参数
+    # --- 4. 构造启动参数 ---
     UPSTREAM_ARGS=""
     while read -r url; do
         [[ -z "$url" || "$url" =~ ^# ]] && continue
         UPSTREAM_ARGS="$UPSTREAM_ARGS --upstream $url"
     done <<< "$DOH_URL_LIST"
 
-    # 5. 生成 Systemd Unit 文件
+    # --- 5. 生成 Systemd Unit 文件 (关键修改) ---
+    # [Docker 修复]: 将 --address 改为 0.0.0.0，允许 Docker 容器通过网桥连接宿主机 DNS
+    # 警告: 这会暴露 53 端口到公网，后续必须配合防火墙规则使用！
     cat > /etc/systemd/system/syspro-doh.service << EOF
 [Unit]
 Description=SysPro DoH Client (Cloudflared)
@@ -626,7 +619,8 @@ User=cloudflared
 # 允许非 Root 用户绑定 53 端口
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-ExecStart=/usr/local/bin/cloudflared proxy-dns --port 53 --address 127.0.0.1 $UPSTREAM_ARGS
+# 监听 0.0.0.0 以支持 Docker 容器访问
+ExecStart=/usr/local/bin/cloudflared proxy-dns --port 53 --address 0.0.0.0 $UPSTREAM_ARGS
 Restart=on-failure
 RestartSec=10
 StandardOutput=null
@@ -635,28 +629,78 @@ StandardOutput=null
 WantedBy=multi-user.target
 EOF
 
-    # 6. 解决端口冲突
+    # --- 6. 解决端口冲突 ---
     # Cloudflared 需要监听 53 端口，必须停用 systemd-resolved
     if systemctl is-active systemd-resolved >/dev/null 2>&1; then
         log_warn "检测到 systemd-resolved 占用 53 端口，正在停用..."
         systemctl stop systemd-resolved
         systemctl disable systemd-resolved
-        # 删除软链接，防止后续写入 resolv.conf 失败
+        # 删除旧的 resolv.conf 链接，防止后续写入失败
         rm -f /etc/resolv.conf
     fi
 
-    # 7. 启动服务与状态检测
+    # --- 7. 防火墙安全加固 (防止 DNS 放大攻击) ---
+    # 因为监听了 0.0.0.0，必须禁止公网访问 53 端口，只允许本机和 Docker 访问
+    log_info "配置防火墙安全规则 (仅允许本地和 Docker 访问 DNS)..."
+    
+    # 获取默认公网网卡名称 (例如 eth0)
+    DEFAULT_IFACE=$(ip route | grep default | head -n1 | awk '{print $5}')
+    
+    if [ -n "$DEFAULT_IFACE" ] && command -v iptables >/dev/null; then
+        # 先清理旧规则，防止重复添加
+        iptables -D INPUT -i "$DEFAULT_IFACE" -p udp --dport 53 -j DROP 2>/dev/null
+        iptables -D INPUT -i "$DEFAULT_IFACE" -p tcp --dport 53 -j DROP 2>/dev/null
+        
+        # 添加 DROP 规则: 丢弃所有从公网网卡进入的 53 端口请求
+        iptables -I INPUT -i "$DEFAULT_IFACE" -p udp --dport 53 -j DROP
+        iptables -I INPUT -i "$DEFAULT_IFACE" -p tcp --dport 53 -j DROP
+        
+        log_success "防火墙已加固: 禁止外部网络 ($DEFAULT_IFACE) 访问本机的 DNS 服务。"
+    else
+        log_warn "未检测到 Iptables 或默认网卡，跳过防火墙配置。请务必手动配置防火墙封锁 UDP/53 入站！"
+    fi
+
+    # --- 8. 自动配置 Docker (如果存在) ---
+    # 让 Docker 容器自动使用宿主机的 DoH 服务
+    if command -v docker >/dev/null 2>&1; then
+        log_info "检测到 Docker 环境，正在配置容器 DNS..."
+        
+        # 获取 docker0 网桥 IP (通常是 172.17.0.1)
+        DOCKER_IP=$(ip -4 addr show docker0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
+        
+        if [ -n "$DOCKER_IP" ]; then
+            # 备份原有的 daemon.json
+            [ -f /etc/docker/daemon.json ] && cp /etc/docker/daemon.json /etc/docker/daemon.json.syspro.bak
+            
+            # 写入 DNS 配置
+            # 注意: 如果用户有复杂的 daemon.json，这里可能会覆盖。生产环境建议使用 jq 工具修改，
+            # 但为了保持脚本轻量，这里采用覆盖/创建策略。
+            if [ ! -f /etc/docker/daemon.json ] || [ ! -s /etc/docker/daemon.json ]; then
+                # 文件不存在，直接创建
+                echo "{ \"dns\": [\"$DOCKER_IP\", \"8.8.8.8\"] }" > /etc/docker/daemon.json
+                log_success "Docker DNS 已配置指向宿主机: $DOCKER_IP"
+                SYSTEM_DOCKER_RESTART_NEEDED=1
+            else
+                # 文件已存在，检查是否已经包含 dns 配置
+                if ! grep -q "dns" /etc/docker/daemon.json; then
+                    log_warn "Docker 配置文件已存在但未检测到 DNS 项。建议手动添加: \"dns\": [\"$DOCKER_IP\"]"
+                else
+                    log_info "Docker 配置文件已包含 DNS 设置，跳过修改。"
+                fi
+            fi
+        fi
+    fi
+
+    # --- 9. 启动服务与状态检测 ---
     systemctl daemon-reload
     systemctl enable syspro-doh >/dev/null 2>&1
     systemctl restart syspro-doh
     
-    log_info "正在等待 DoH 服务启动..."
+    log_info "正在启动 DoH 服务..."
     
-    # 轮询检查状态 (替代 sleep 3)
-    # 尝试 20 次，每次间隔 0.2 秒，最长等待 4 秒
+    # 轮询检查状态 (等待 4 秒)
     local max_retries=20
     local started=0
-    
     for ((i=1; i<=max_retries; i++)); do
         if systemctl is-active --quiet syspro-doh; then
             started=1
@@ -667,9 +711,15 @@ EOF
     
     if [ $started -eq 1 ]; then
         log_success "DoH 服务启动成功。"
+        # 如果刚才修改了 Docker 配置，需要重启 Docker 才能生效
+        if [ "$SYSTEM_DOCKER_RESTART_NEEDED" == "1" ]; then
+            log_info "重启 Docker 服务以应用 DNS 配置..."
+            systemctl restart docker
+            log_success "Docker 重启完成，容器网络已接管。"
+        fi
         return 0
     else
-        log_err "DoH 服务启动超时或失败，正在输出最后 10 行日志..."
+        log_err "DoH 服务启动失败，请检查日志。"
         journalctl -u syspro-doh --no-pager -n 10
         return 1
     fi
@@ -1104,39 +1154,31 @@ EOF
 }
 
 # ==============================================================================
-#   模块 9: 卸载 SysPro (Docker 修复增强版)
-#   说明: 包含日志恢复、网络栈重置、DNS 软链接重建及 Docker 缓存刷新
+#   模块 9: 卸载 SysPro (完整回滚版)
+#   功能: 恢复日志、还原 Docker 网络、清理防火墙规则、重置 DNS 链接
 # ==============================================================================
 uninstall_syspro() {
     echo -e "${RED}警告: 正在卸载 SysPro 及所有扩展组件...${PLAIN}"
     
-    # --------------------------------------------------------------------------
-    # 1. 恢复日志系统 (如果曾被脚本9号选项“日志杀手”彻底禁用)
-    # --------------------------------------------------------------------------
+    # --- 1. 恢复日志系统 (如果曾被禁用) ---
     if [ -f "/etc/syspro_logs_killed" ]; then
-        log_info "检测到日志系统曾被禁用，正在执行恢复操作..."
+        log_info "检测到日志系统曾被禁用，正在恢复..."
         
-        # 1.1 解锁文件系统不可变属性 (chattr -i)
-        # 之前为了防止日志写入锁定了 /var/log，现在必须解锁才能删除或写入
-        if command -v chattr >/dev/null 2>&1; then
-            chattr -R -i /var/log 2>/dev/null
-        fi
+        # 解锁文件系统不可变属性 (chattr -i)
+        command -v chattr >/dev/null 2>&1 && chattr -R -i /var/log 2>/dev/null
         
-        # 1.2 恢复目录权限
-        # 之前改为 555 (只读)，恢复为标准的 755
+        # 恢复目录权限
         chmod -R 755 /var/log
         
-        # 1.3 移除内核静音配置 (恢复控制台报错显示)
+        # 移除内核静音配置
         rm -f /etc/sysctl.d/95-syspro-silence.conf
         
-        # 1.4 恢复 Journald 配置
-        # 如果配置文件被清空或不存在，写入标准的默认配置
-        if [ ! -f /etc/systemd/journald.conf ] || [ ! -s /etc/systemd/journald.conf ]; then
+        # 恢复 Journald 配置
+        if [ ! -s /etc/systemd/journald.conf ]; then
              echo -e "[Journal]\nStorage=auto\nSystemMaxUse=200M" > /etc/systemd/journald.conf
         fi
         
-        # 1.5 解除服务屏蔽 (Unmask) 并重启
-        # 恢复 rsyslog, journald, auditd 等基础服务
+        # 恢复基础服务
         local SERVICES=("rsyslog" "systemd-journald" "syslog" "kdump" "auditd" "avahi-daemon")
         for svc in "${SERVICES[@]}"; do
             systemctl unmask "$svc" 2>/dev/null
@@ -1144,120 +1186,118 @@ uninstall_syspro() {
             systemctl restart "$svc" 2>/dev/null
         done
         
-        # 1.6 删除状态标记文件
         rm -f /etc/syspro_logs_killed
         log_success "日志系统功能已恢复。"
     fi
 
-    # --------------------------------------------------------------------------
-    # 2. 清理网络组件与修复 DNS (核心：解决 Docker 断网问题)
-    # --------------------------------------------------------------------------
-    log_info "正在清理网络组件并恢复系统默认 DNS..."
+    # --- 2. 清理网络组件与安全规则 ---
+    log_info "正在清理网络组件与安全规则..."
     
-    # 2.1 停止并删除 DoH 客户端 (Cloudflared)
+    # 2.1 移除 DoH 服务
     systemctl disable --now syspro-doh >/dev/null 2>&1
     rm -f /etc/systemd/system/syspro-doh.service
     rm -f /usr/local/bin/cloudflared 
     
-    # 2.2 恢复 /etc/resolv.conf 结构
-    # [关键点] Docker 依赖宿主机的 resolv.conf。如果宿主机使用 systemd-resolved，
-    # resolv.conf 必须是一个指向 /run/systemd/... 的软链接，否则 Docker 容器内 DNS 会出错。
+    # 2.2 清理防火墙规则 (移除之前添加的 DROP 规则)
+    DEFAULT_IFACE=$(ip route | grep default | head -n1 | awk '{print $5}')
+    if [ -n "$DEFAULT_IFACE" ] && command -v iptables >/dev/null; then
+        # 删除禁止公网访问 53 端口的规则
+        iptables -D INPUT -i "$DEFAULT_IFACE" -p udp --dport 53 -j DROP 2>/dev/null
+        iptables -D INPUT -i "$DEFAULT_IFACE" -p tcp --dport 53 -j DROP 2>/dev/null
+        log_info "防火墙规则已清理 (解封 53 端口)。"
+    fi
     
-    # 先解锁文件，防止因 chattr +i 导致无法修改
+    # 2.3 还原 Docker 配置文件
+    RESTART_DOCKER=0
+    if [ -f /etc/docker/daemon.json.syspro.bak ]; then
+        # 如果有备份，直接还原
+        mv /etc/docker/daemon.json.syspro.bak /etc/docker/daemon.json
+        log_info "已还原 Docker 原始 daemon.json 配置文件。"
+        RESTART_DOCKER=1
+    elif [ -f /etc/docker/daemon.json ]; then
+        # 如果没有备份，但发现文件里包含我们要清理的 IP 配置，则删除
+        if grep -q "172.17.0.1" /etc/docker/daemon.json; then
+             rm -f /etc/docker/daemon.json
+             log_info "已删除脚本生成的 Docker 配置文件。"
+             RESTART_DOCKER=1
+        fi
+    fi
+
+    # --- 3. 修复系统 DNS (解决 Docker 断网核心) ---
+    log_info "正在重置系统 DNS 配置..."
+    
+    # 解锁 resolv.conf
     if command -v chattr >/dev/null 2>&1; then chattr -i /etc/resolv.conf 2>/dev/null; fi
     
-    # 检测系统是否支持 systemd-resolved (Debian 10+, Ubuntu 18.04+, CentOS 9)
+    # 判断是否为 Ubuntu/Debian 等使用 systemd-resolved 的系统
     if systemctl list-unit-files | grep -q "systemd-resolved"; then
-        log_info "检测到 systemd-resolved 环境，正在重建标准软链接..."
         
-        # 恢复服务状态
+        # 恢复服务
         systemctl unmask systemd-resolved 2>/dev/null
-        systemctl enable systemd-resolved 2>/dev/null
-        systemctl restart systemd-resolved 2>/dev/null
+        systemctl enable --now systemd-resolved 2>/dev/null
         
-        # 强制重建软链接 (这是修复 Docker 的关键步骤)
-        # 如果 /run/... 下的存根文件存在，则建立链接
+        # [关键修复] 重建软链接
+        # Docker 依赖此链接来正确复制宿主机 DNS。如果文件是静态的，Docker 处理方式不同。
         if [ -f /run/systemd/resolve/stub-resolv.conf ]; then
             rm -f /etc/resolv.conf
             ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-            log_success "/etc/resolv.conf 已恢复为系统标准软链接。"
+            log_success "/etc/resolv.conf 已恢复为标准软链接。"
         else
-            # 备选方案：如果找不到存根文件，回退到静态 Google DNS
+            # 存根不存在，回退到 Google DNS
             rm -f /etc/resolv.conf
             echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/resolv.conf
-            log_warn "未找到 systemd-resolved 存根，已回退为静态 DNS 配置。"
+            log_warn "Systemd-resolved 存根未找到，已回退为静态 DNS。"
         fi
     else
-        # 适用于 CentOS 7 或不使用 systemd-resolved 的老系统
+        # CentOS 7 等老系统
         rm -f /etc/resolv.conf
         echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/resolv.conf
-        log_success "DNS 已重置为公共 DNS (无 systemd-resolved)。"
+        log_success "DNS 已重置为公共 DNS。"
     fi
 
-    # 2.3 强制重启 Docker 服务
-    # [关键点] 修改 resolv.conf 后，必须重启 Docker 守护进程，
-    # 否则容器启动时仍会使用旧的缓存配置或 Google 默认 DNS。
-    if systemctl is-active docker >/dev/null 2>&1; then
-        log_info "正在重启 Docker 服务以刷新网络配置..."
+    # 2.4 重启 Docker (应用配置还原)
+    if [[ "$RESTART_DOCKER" == "1" ]] && systemctl is-active docker >/dev/null 2>&1; then
         systemctl restart docker
-        log_success "Docker 服务已重启，容器 DNS 应已恢复正常。"
+        log_success "Docker 服务已重启，网络配置已回滚。"
     fi
 
-    # --------------------------------------------------------------------------
-    # 3. 清理常规优化组件
-    # --------------------------------------------------------------------------
+    # --- 4. 清理常规优化组件 ---
+    # 移除 ZRAM
+    systemctl disable --now zram >/dev/null 2>&1
+    rm -f /usr/local/bin/zram-start.sh /etc/systemd/system/zram.service
     
-    # 3.1 移除 ZRAM 内存压缩
-    if systemctl is-active zram >/dev/null 2>&1; then
-        systemctl disable --now zram >/dev/null 2>&1
-    fi
-    rm -f /etc/systemd/system/zram.service
-    rm -f /usr/local/bin/zram-start.sh
+    # 清理内核参数
+    rm -f /etc/sysctl.d/97-syspro-latency.conf
+    rm -f /etc/sysctl.d/99-syspro-swap.conf
+    rm -f /etc/sysctl.d/98-syspro-security.conf
+    rm -f /etc/sysctl.d/96-no-audit.conf
     
-    # 3.2 清理内核参数 (Sysctl)
-    log_info "正在清理内核优化参数..."
-    rm -f /etc/sysctl.d/97-syspro-latency.conf  # 调度器
-    rm -f /etc/sysctl.d/99-syspro-swap.conf     # Swappiness
-    rm -f /etc/sysctl.d/98-syspro-security.conf # 安全参数
-    rm -f /etc/sysctl.d/96-no-audit.conf        # Auditd 屏蔽
-    
-    # 3.3 清理 Swap 与 Fstab 挂载
-    if [ -f "/swapfile" ]; then 
-        swapoff /swapfile 2>/dev/null
-        rm -f /swapfile
-    fi
-    # 还原 /etc/fstab (移除 noatime)
+    # 清理 Swap 与 Fstab
+    if [ -f "/swapfile" ]; then swapoff /swapfile 2>/dev/null; rm -f /swapfile; fi
     if [ -f /etc/fstab.syspro.bak ]; then 
         cp /etc/fstab.syspro.bak /etc/fstab
         mount -o remount / 2>/dev/null
         rm -f /etc/fstab.syspro.bak
     fi
     
-    # 3.4 清理 Udev 磁盘调度规则
+    # 清理 Udev 规则
     rm -f /etc/udev/rules.d/60-io-scheduler.rules
-    if command -v udevadm >/dev/null 2>&1; then 
-        udevadm control --reload && udevadm trigger
-    fi
+    if command -v udevadm >/dev/null 2>&1; then udevadm control --reload && udevadm trigger; fi
     
-    # 3.5 清理 Systemd 限制与 OOM 保护
-    rm -rf /etc/systemd/system/ssh.service.d
-    rm -rf /etc/systemd/system/sshd.service.d
+    # 清理 Systemd 额外配置
+    rm -rf /etc/systemd/system/ssh.service.d /etc/systemd/system/sshd.service.d
     rm -f /etc/security/limits.d/99-disable-core.conf
-    
-    # 还原 Systemd 全局文件 (恢复默认文件句柄限制)
     if [ -f /etc/systemd/system.conf.syspro.bak ]; then
         cp /etc/systemd/system.conf.syspro.bak /etc/systemd/system.conf
     fi
     
-    # --------------------------------------------------------------------------
-    # 4. 刷新系统状态
-    # --------------------------------------------------------------------------
+    # --- 5. 刷新系统状态 ---
     systemctl daemon-reload
     sysctl --system >/dev/null 2>&1
     
     echo ""
     echo -e "${GREEN}SysPro 已成功完全卸载。${PLAIN}"
-    echo -e "${YELLOW}提示: 建议重启服务器 (reboot) 以彻底重置 CPU 调度器和内存状态。${PLAIN}"
+    echo -e "${YELLOW}提示: Docker 配置已尝试还原，建议重启一次服务器以彻底重置内核状态。${PLAIN}"
 }
 
 show_menu() {
