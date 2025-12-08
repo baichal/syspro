@@ -564,12 +564,12 @@ EOF
 }
 
 # ==============================================================================
-#   模块 5: 辅助函数 - Cloudflared 安装与启动 (无防火墙/高可用修复版)
+#   模块 5: 辅助函数 - Cloudflared 安装与启动 (无防火墙/Docker修复版)
 # ==============================================================================
 install_cloudflared() {
     log_info "开始部署 Cloudflared DoH 客户端 (无防火墙兼容模式)..."
     
-    # --- 1. 架构判断与下载链接 ---
+    # --- 1. 架构判断与下载 (增强网络容错) ---
     case $ARCH in
         amd64) URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" ;;
         arm64) URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64" ;;
@@ -577,10 +577,10 @@ install_cloudflared() {
         *) log_err "Cloudflared 不支持当前架构: $ARCH ($RAW_ARCH)"; return 1 ;;
     esac
 
-    # --- 2. 下载二进制文件 (增加超时重试机制) ---
+    # 检查是否存在，不存在则下载
     if [ ! -f /usr/local/bin/cloudflared ]; then
         log_info "正在从 GitHub 下载二进制文件 ($ARCH)..."
-        # 修复: 增加 max-time 防止下载卡死，connect-timeout 防止连接超时
+        # [修复] 增加 connect-timeout 和 max-time 防止下载一直卡住，并重试 3 次
         if curl -L --retry 3 --connect-timeout 10 --max-time 120 -o /usr/local/bin/cloudflared "$URL"; then
             chmod +x /usr/local/bin/cloudflared
         else
@@ -592,19 +592,20 @@ install_cloudflared() {
         chmod +x /usr/local/bin/cloudflared
     fi
     
-    # --- 3. 创建专用用户 (安全性) ---
+    # --- 2. 创建专用用户 (安全性) ---
     id -u cloudflared &>/dev/null || useradd -M -s /usr/sbin/nologin cloudflared
 
-    # --- 4. 构造启动参数 ---
+    # --- 3. 构造启动参数 ---
     UPSTREAM_ARGS=""
     while read -r url; do
         [[ -z "$url" || "$url" =~ ^# ]] && continue
         UPSTREAM_ARGS="$UPSTREAM_ARGS --upstream $url"
     done <<< "$DOH_URL_LIST"
 
-    # --- 5. 生成 Systemd Unit 文件 (关键修复) ---
-    # 修复: 增加 --bootstrap-dns 1.1.1.1
-    # 原因: 防止 Cloudflared 启动时因为本机 DNS 尚未生效而无法解析上游域名，导致启动失败。
+    # --- 4. 生成 Systemd 服务文件 (核心修复) ---
+    # [修复] 增加 --bootstrap-dns 1.1.1.1
+    # 原因: Cloudflared 启动时需要解析上游域名，如果此时本机 DNS 还没生效，启动会失败。
+    # 这里强制指定启动时用 1.1.1.1 进行引导解析，防止死锁。
     cat > /etc/systemd/system/syspro-doh.service << EOF
 [Unit]
 Description=SysPro DoH Client (Cloudflared)
@@ -628,24 +629,24 @@ StandardOutput=null
 WantedBy=multi-user.target
 EOF
 
-    # --- 6. 彻底解决 53 端口冲突 ---
+    # --- 5. 彻底解决 53 端口冲突 ---
     # Cloudflared 需要监听 53 端口，必须停用 systemd-resolved
     if systemctl is-active systemd-resolved >/dev/null 2>&1 || systemctl is-enabled systemd-resolved >/dev/null 2>&1; then
         log_warn "检测到 systemd-resolved 占用 53 端口，正在彻底停用..."
         systemctl stop systemd-resolved
         systemctl disable systemd-resolved
-        # 修复: Mask 服务，防止重启后自动复活
+        # [修复] 使用 mask 彻底屏蔽，防止重启机器后该服务自动复活抢占端口
         systemctl mask systemd-resolved
         # 删除旧的 resolv.conf 链接，防止后续写入失败
         rm -f /etc/resolv.conf
     fi
 
-    # --- 7. 防火墙安全加固 (跳过) ---
-    # 修复: 用户明确指出宿主机无防火墙，跳过 iptables 操作。
-    # 避免因错误的 DROP 规则导致 Docker 容器流量被拦截。
-    log_info "检测到无防火墙模式，跳过 iptables 规则配置 (允许所有 DNS 请求)..."
+    # --- 6. 防火墙配置 (已移除) ---
+    # [修复] 用户明确指出宿主机无防火墙，直接跳过 iptables 操作。
+    # 避免了错误的 DROP 规则导致 Docker 容器流量被拦截。
+    log_info "无防火墙模式：跳过 iptables 配置，允许所有 DNS 请求。"
 
-    # --- 8. 自动配置 Docker (关键修复) ---
+    # --- 7. 自动配置 Docker (核心修复) ---
     if command -v docker >/dev/null 2>&1; then
         log_info "检测到 Docker 环境，正在优化容器 DNS..."
         
@@ -656,7 +657,7 @@ EOF
             # 备份原有的 daemon.json
             [ -f /etc/docker/daemon.json ] && cp /etc/docker/daemon.json /etc/docker/daemon.json.syspro.bak
             
-            # 修复: 仅配置宿主机 IP，去掉备用 DNS (8.8.8.8)
+            # [修复] 仅配置宿主机 IP，去掉备用 DNS (8.8.8.8)
             # 原因: 防止 DoH 响应稍慢时 Docker 自动切换到不稳定的 8.8.8.8，导致解析卡顿或超时。
             if [ ! -f /etc/docker/daemon.json ] || [ ! -s /etc/docker/daemon.json ]; then
                 # 文件不存在，直接创建
@@ -675,14 +676,14 @@ EOF
         fi
     fi
 
-    # --- 9. 启动服务与状态检测 ---
+    # --- 8. 启动服务与状态检测 ---
     systemctl daemon-reload
     systemctl enable syspro-doh >/dev/null 2>&1
     systemctl restart syspro-doh
     
     log_info "正在启动 DoH 服务..."
     
-    # 轮询检查端口 (更可靠的检测方式)
+    # 轮询检查端口 (比单纯看服务状态更准确)
     local started=0
     for ((i=1; i<=10; i++)); do
         # 检查是否监听了 53 端口
@@ -735,17 +736,12 @@ optimize_access() {
     # 写入 profile.d 以便对所有用户生效
     cat > /etc/profile.d/syspro_shell.sh << 'EOF'
 # SysPro Shell 配置
-# 1. 增加历史记录容量
 export HISTSIZE=10000
 export HISTFILESIZE=20000
-# 2. 忽略重复命令
 export HISTCONTROL=ignoreboth
-# 3. 增加时间戳 (年-月-日 时:分:秒)
 export HISTTIMEFORMAT="%F %T "
-# 4. 防止多窗口覆盖历史记录
 shopt -s histappend
 export PROMPT_COMMAND="history -a; history -c; history -r; $PROMPT_COMMAND"
-# 5. Root 用户提示符标红
 if [ "$EUID" -eq 0 ]; then
     PS1='\[\e[1;31m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
 fi
@@ -775,9 +771,9 @@ EOF
             echo "# SysPro DoH (Cloudflared)" > /etc/resolv.conf
             echo "nameserver 127.0.0.1" >> /etc/resolv.conf
             
-            # 修复: 放宽超时时间和重试次数
+            # [修复] 放宽超时时间和重试次数
             # timeout:5 -> 给予 5 秒等待时间，适应 HTTPS 握手延迟
-            # attempts:2 -> 允许重试一次
+            # attempts:2 -> 允许重试一次，防止单次抖动导致失败
             echo "options timeout:5 attempts:2" >> /etc/resolv.conf
             
             chattr +i /etc/resolv.conf
@@ -1140,8 +1136,8 @@ EOF
 }
 
 # ==============================================================================
-#   模块 9: 卸载 SysPro (完整回滚版)
-#   功能: 恢复日志、还原 Docker 网络、清理防火墙规则、重置 DNS 链接
+#   模块 9: 卸载 SysPro (完整回滚版 - 已更新)
+#   功能: 恢复日志、还原 Docker 网络、清理旧版防火墙规则、重置 DNS
 # ==============================================================================
 uninstall_syspro() {
     echo -e "${RED}警告: 正在卸载 SysPro 及所有扩展组件...${PLAIN}"
@@ -1184,28 +1180,34 @@ uninstall_syspro() {
     rm -f /etc/systemd/system/syspro-doh.service
     rm -f /usr/local/bin/cloudflared 
     
-    # 2.2 清理防火墙规则 (移除之前添加的 DROP 规则)
+    # 2.2 清理防火墙规则 (兼容清理旧版本脚本可能留下的规则)
     DEFAULT_IFACE=$(ip route | grep default | head -n1 | awk '{print $5}')
     if [ -n "$DEFAULT_IFACE" ] && command -v iptables >/dev/null; then
-        # 删除禁止公网访问 53 端口的规则
+        # 尝试删除 INPUT DROP 规则，忽略不存在的错误
         iptables -D INPUT -i "$DEFAULT_IFACE" -p udp --dport 53 -j DROP 2>/dev/null
         iptables -D INPUT -i "$DEFAULT_IFACE" -p tcp --dport 53 -j DROP 2>/dev/null
-        log_info "防火墙规则已清理 (解封 53 端口)。"
+        # 清理 Docker 相关的显式放行规则
+        iptables -D INPUT -i docker0 -p udp --dport 53 -j ACCEPT 2>/dev/null
+        iptables -D INPUT -i docker0 -p tcp --dport 53 -j ACCEPT 2>/dev/null
+        log_info "防火墙规则清理尝试完成。"
     fi
     
-    # 2.3 还原 Docker 配置文件
+    # 2.3 还原 Docker 配置文件 (改进匹配逻辑)
     RESTART_DOCKER=0
     if [ -f /etc/docker/daemon.json.syspro.bak ]; then
-        # 如果有备份，直接还原
+        # 场景A: 存在备份文件，直接还原
         mv /etc/docker/daemon.json.syspro.bak /etc/docker/daemon.json
         log_info "已还原 Docker 原始 daemon.json 配置文件。"
         RESTART_DOCKER=1
     elif [ -f /etc/docker/daemon.json ]; then
-        # 如果没有备份，但发现文件里包含我们要清理的 IP 配置，则删除
-        if grep -q "172.17.0.1" /etc/docker/daemon.json; then
+        # 场景B: 无备份，但文件存在。
+        # 检查是否为脚本生成的简单单行配置 (包含 "dns" 且行数为 1)
+        if grep -q "dns" /etc/docker/daemon.json && [ $(wc -l < /etc/docker/daemon.json) -eq 1 ]; then
              rm -f /etc/docker/daemon.json
              log_info "已删除脚本生成的 Docker 配置文件。"
              RESTART_DOCKER=1
+        else
+             log_warn "Docker 配置文件似乎被修改过，为安全起见未自动删除。请手动检查: /etc/docker/daemon.json"
         fi
     fi
 
@@ -1218,12 +1220,12 @@ uninstall_syspro() {
     # 判断是否为 Ubuntu/Debian 等使用 systemd-resolved 的系统
     if systemctl list-unit-files | grep -q "systemd-resolved"; then
         
-        # 恢复服务
+        # 恢复服务 (关键: Unmask)
         systemctl unmask systemd-resolved 2>/dev/null
         systemctl enable --now systemd-resolved 2>/dev/null
         
         # [关键修复] 重建软链接
-        # Docker 依赖此链接来正确复制宿主机 DNS。如果文件是静态的，Docker 处理方式不同。
+        # Docker 依赖此链接来正确复制宿主机 DNS。
         if [ -f /run/systemd/resolve/stub-resolv.conf ]; then
             rm -f /etc/resolv.conf
             ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
@@ -1234,6 +1236,9 @@ uninstall_syspro() {
             echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/resolv.conf
             log_warn "Systemd-resolved 存根未找到，已回退为静态 DNS。"
         fi
+        
+        # 尝试重启 resolved 以重新生成配置
+        systemctl restart systemd-resolved 2>/dev/null
     else
         # CentOS 7 等老系统
         rm -f /etc/resolv.conf
