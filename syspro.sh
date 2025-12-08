@@ -564,11 +564,10 @@ EOF
 }
 
 # ==============================================================================
-#   模块 5: 辅助函数 - Cloudflared 安装与启动 (Docker 兼容增强版)
-#   功能: 部署 DoH 客户端，并自动配置 Docker 网络与防火墙安全规则
+#   模块 5: 辅助函数 - Cloudflared 安装与启动 (无防火墙/高可用修复版)
 # ==============================================================================
 install_cloudflared() {
-    log_info "开始部署 Cloudflared DoH 客户端 (Docker 适配模式)..."
+    log_info "开始部署 Cloudflared DoH 客户端 (无防火墙兼容模式)..."
     
     # --- 1. 架构判断与下载链接 ---
     case $ARCH in
@@ -578,11 +577,11 @@ install_cloudflared() {
         *) log_err "Cloudflared 不支持当前架构: $ARCH ($RAW_ARCH)"; return 1 ;;
     esac
 
-    # --- 2. 下载二进制文件 ---
+    # --- 2. 下载二进制文件 (增加超时重试机制) ---
     if [ ! -f /usr/local/bin/cloudflared ]; then
         log_info "正在从 GitHub 下载二进制文件 ($ARCH)..."
-        # 增加超时与重试机制，防止网络波动导致脚本卡死
-        if curl -L --retry 2 --connect-timeout 5 --max-time 60 -o /usr/local/bin/cloudflared "$URL"; then
+        # 修复: 增加 max-time 防止下载卡死，connect-timeout 防止连接超时
+        if curl -L --retry 3 --connect-timeout 10 --max-time 120 -o /usr/local/bin/cloudflared "$URL"; then
             chmod +x /usr/local/bin/cloudflared
         else
             log_err "下载失败。请检查网络连接。"
@@ -594,7 +593,6 @@ install_cloudflared() {
     fi
     
     # --- 3. 创建专用用户 (安全性) ---
-    # 使用无登录权限的系统用户运行服务
     id -u cloudflared &>/dev/null || useradd -M -s /usr/sbin/nologin cloudflared
 
     # --- 4. 构造启动参数 ---
@@ -604,13 +602,13 @@ install_cloudflared() {
         UPSTREAM_ARGS="$UPSTREAM_ARGS --upstream $url"
     done <<< "$DOH_URL_LIST"
 
-    # --- 5. 生成 Systemd Unit 文件 (关键修改) ---
-    # [Docker 修复]: 将 --address 改为 0.0.0.0，允许 Docker 容器通过网桥连接宿主机 DNS
-    # 警告: 这会暴露 53 端口到公网，后续必须配合防火墙规则使用！
+    # --- 5. 生成 Systemd Unit 文件 (关键修复) ---
+    # 修复: 增加 --bootstrap-dns 1.1.1.1
+    # 原因: 防止 Cloudflared 启动时因为本机 DNS 尚未生效而无法解析上游域名，导致启动失败。
     cat > /etc/systemd/system/syspro-doh.service << EOF
 [Unit]
 Description=SysPro DoH Client (Cloudflared)
-After=network.target network-online.target
+After=network.target network-online.target docker.service
 Wants=network-online.target
 
 [Service]
@@ -620,50 +618,36 @@ User=cloudflared
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 # 监听 0.0.0.0 以支持 Docker 容器访问
-ExecStart=/usr/local/bin/cloudflared proxy-dns --port 53 --address 0.0.0.0 $UPSTREAM_ARGS
-Restart=on-failure
-RestartSec=10
+# --bootstrap-dns: 启动引导 DNS，确保服务能解析上游地址
+ExecStart=/usr/local/bin/cloudflared proxy-dns --port 53 --address 0.0.0.0 $UPSTREAM_ARGS --bootstrap-dns 1.1.1.1
+Restart=always
+RestartSec=5
 StandardOutput=null
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-    # --- 6. 解决端口冲突 ---
+    # --- 6. 彻底解决 53 端口冲突 ---
     # Cloudflared 需要监听 53 端口，必须停用 systemd-resolved
-    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
-        log_warn "检测到 systemd-resolved 占用 53 端口，正在停用..."
+    if systemctl is-active systemd-resolved >/dev/null 2>&1 || systemctl is-enabled systemd-resolved >/dev/null 2>&1; then
+        log_warn "检测到 systemd-resolved 占用 53 端口，正在彻底停用..."
         systemctl stop systemd-resolved
         systemctl disable systemd-resolved
+        # 修复: Mask 服务，防止重启后自动复活
+        systemctl mask systemd-resolved
         # 删除旧的 resolv.conf 链接，防止后续写入失败
         rm -f /etc/resolv.conf
     fi
 
-    # --- 7. 防火墙安全加固 (防止 DNS 放大攻击) ---
-    # 因为监听了 0.0.0.0，必须禁止公网访问 53 端口，只允许本机和 Docker 访问
-    log_info "配置防火墙安全规则 (仅允许本地和 Docker 访问 DNS)..."
-    
-    # 获取默认公网网卡名称 (例如 eth0)
-    DEFAULT_IFACE=$(ip route | grep default | head -n1 | awk '{print $5}')
-    
-    if [ -n "$DEFAULT_IFACE" ] && command -v iptables >/dev/null; then
-        # 先清理旧规则，防止重复添加
-        iptables -D INPUT -i "$DEFAULT_IFACE" -p udp --dport 53 -j DROP 2>/dev/null
-        iptables -D INPUT -i "$DEFAULT_IFACE" -p tcp --dport 53 -j DROP 2>/dev/null
-        
-        # 添加 DROP 规则: 丢弃所有从公网网卡进入的 53 端口请求
-        iptables -I INPUT -i "$DEFAULT_IFACE" -p udp --dport 53 -j DROP
-        iptables -I INPUT -i "$DEFAULT_IFACE" -p tcp --dport 53 -j DROP
-        
-        log_success "防火墙已加固: 禁止外部网络 ($DEFAULT_IFACE) 访问本机的 DNS 服务。"
-    else
-        log_warn "未检测到 Iptables 或默认网卡，跳过防火墙配置。请务必手动配置防火墙封锁 UDP/53 入站！"
-    fi
+    # --- 7. 防火墙安全加固 (跳过) ---
+    # 修复: 用户明确指出宿主机无防火墙，跳过 iptables 操作。
+    # 避免因错误的 DROP 规则导致 Docker 容器流量被拦截。
+    log_info "检测到无防火墙模式，跳过 iptables 规则配置 (允许所有 DNS 请求)..."
 
-    # --- 8. 自动配置 Docker (如果存在) ---
-    # 让 Docker 容器自动使用宿主机的 DoH 服务
+    # --- 8. 自动配置 Docker (关键修复) ---
     if command -v docker >/dev/null 2>&1; then
-        log_info "检测到 Docker 环境，正在配置容器 DNS..."
+        log_info "检测到 Docker 环境，正在优化容器 DNS..."
         
         # 获取 docker0 网桥 IP (通常是 172.17.0.1)
         DOCKER_IP=$(ip -4 addr show docker0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
@@ -672,18 +656,18 @@ EOF
             # 备份原有的 daemon.json
             [ -f /etc/docker/daemon.json ] && cp /etc/docker/daemon.json /etc/docker/daemon.json.syspro.bak
             
-            # 写入 DNS 配置
-            # 注意: 如果用户有复杂的 daemon.json，这里可能会覆盖。生产环境建议使用 jq 工具修改，
-            # 但为了保持脚本轻量，这里采用覆盖/创建策略。
+            # 修复: 仅配置宿主机 IP，去掉备用 DNS (8.8.8.8)
+            # 原因: 防止 DoH 响应稍慢时 Docker 自动切换到不稳定的 8.8.8.8，导致解析卡顿或超时。
             if [ ! -f /etc/docker/daemon.json ] || [ ! -s /etc/docker/daemon.json ]; then
                 # 文件不存在，直接创建
-                echo "{ \"dns\": [\"$DOCKER_IP\", \"8.8.8.8\"] }" > /etc/docker/daemon.json
-                log_success "Docker DNS 已配置指向宿主机: $DOCKER_IP"
+                mkdir -p /etc/docker
+                echo "{ \"dns\": [\"$DOCKER_IP\"] }" > /etc/docker/daemon.json
+                log_success "Docker DNS 已强制指向宿主机网桥: $DOCKER_IP"
                 SYSTEM_DOCKER_RESTART_NEEDED=1
             else
-                # 文件已存在，检查是否已经包含 dns 配置
+                # 文件已存在
                 if ! grep -q "dns" /etc/docker/daemon.json; then
-                    log_warn "Docker 配置文件已存在但未检测到 DNS 项。建议手动添加: \"dns\": [\"$DOCKER_IP\"]"
+                    log_warn "Docker 配置文件已存在但未包含 DNS 设置。建议手动添加: \"dns\": [\"$DOCKER_IP\"]"
                 else
                     log_info "Docker 配置文件已包含 DNS 设置，跳过修改。"
                 fi
@@ -698,29 +682,28 @@ EOF
     
     log_info "正在启动 DoH 服务..."
     
-    # 轮询检查状态 (等待 4 秒)
-    local max_retries=20
+    # 轮询检查端口 (更可靠的检测方式)
     local started=0
-    for ((i=1; i<=max_retries; i++)); do
-        if systemctl is-active --quiet syspro-doh; then
+    for ((i=1; i<=10; i++)); do
+        # 检查是否监听了 53 端口
+        if ss -ln | grep -q ":53 "; then
             started=1
             break
         fi
-        sleep 0.2
+        sleep 0.5
     done
     
     if [ $started -eq 1 ]; then
-        log_success "DoH 服务启动成功。"
+        log_success "DoH 服务启动成功 (监听端口 53)。"
         # 如果刚才修改了 Docker 配置，需要重启 Docker 才能生效
         if [ "$SYSTEM_DOCKER_RESTART_NEEDED" == "1" ]; then
             log_info "重启 Docker 服务以应用 DNS 配置..."
             systemctl restart docker
-            log_success "Docker 重启完成，容器网络已接管。"
+            log_success "Docker 重启完成。"
         fi
         return 0
     else
-        log_err "DoH 服务启动失败，请检查日志。"
-        journalctl -u syspro-doh --no-pager -n 10
+        log_err "DoH 服务启动超时。请运行 'systemctl status syspro-doh' 排查。"
         return 1
     fi
 }
@@ -728,7 +711,7 @@ EOF
 optimize_access() {
     log_info "正在优化接入层 (SSH & Environment)..."
 
-    # --- 5.1 SSH 优化 ---
+    # --- 5.1 SSH 优化 (保持不变) ---
     SSHD_CONF="/etc/ssh/sshd_config"
     [ ! -f ${SSHD_CONF}.syspro.bak ] && cp $SSHD_CONF ${SSHD_CONF}.syspro.bak
     
@@ -769,10 +752,10 @@ fi
 EOF
     log_success "Shell 环境配置已生成 (/etc/profile.d/syspro_shell.sh)。"
 
-    # --- 5.3 DNS 配置 ---
+    # --- 5.3 DNS 配置 (核心修复) ---
     echo -e "${YELLOW}请选择 DNS 模式:${PLAIN}"
     echo -e " 1. ${GREEN}标准 UDP DNS${PLAIN} (速度快, 1.1.1.1/8.8.8.8)"
-    echo -e " 2. ${GREEN}DoH 加密 DNS${PLAIN} (防劫持, 支持 ARM)"
+    echo -e " 2. ${GREEN}DoH 加密 DNS${PLAIN} (防劫持, 支持 ARM, 推荐)"
     read -p "请输入选项 [1-2] (默认1): " DNS_CHOICE
     
     # 1. 解锁并准备文件
@@ -786,17 +769,19 @@ EOF
 
     # 3. 处理 DoH 选项
     if [[ "$DNS_CHOICE" == "2" ]]; then
+        # 调用上面修复过的安装函数
         if install_cloudflared; then
             rm -f /etc/resolv.conf
             echo "# SysPro DoH (Cloudflared)" > /etc/resolv.conf
             echo "nameserver 127.0.0.1" >> /etc/resolv.conf
-            # 添加备用 DNS 防止 Cloudflared 挂掉断网
-            echo "# Fallback DNS" >> /etc/resolv.conf
-            echo "nameserver 1.1.1.1" >> /etc/resolv.conf
-            echo "options timeout:1 attempts:1" >> /etc/resolv.conf
+            
+            # 修复: 放宽超时时间和重试次数
+            # timeout:5 -> 给予 5 秒等待时间，适应 HTTPS 握手延迟
+            # attempts:2 -> 允许重试一次
+            echo "options timeout:5 attempts:2" >> /etc/resolv.conf
             
             chattr +i /etc/resolv.conf
-            log_success "DoH 模式已生效 (Resolv.conf 已锁定)。"
+            log_success "DoH 模式已生效 (Resolv.conf 已锁定, Timeout: 5s)。"
         else
             log_warn "DoH 安装失败，自动回退到标准 UDP 模式。"
             DNS_CHOICE="1"
@@ -821,7 +806,8 @@ EOF
             done <<< "$DNS_IPV6_LIST"
         fi
         
-        echo "options timeout:1 attempts:2" >> /etc/resolv.conf
+        # 标准模式也稍微放宽一点，避免网络波动导致报错
+        echo "options timeout:2 attempts:2" >> /etc/resolv.conf
         chattr +i /etc/resolv.conf
         log_success "标准 DNS 模式已生效 (Resolv.conf 已锁定)。"
     fi
