@@ -362,52 +362,69 @@ EOF
 }
 
 # ==============================================================================
-#   模块 3-2: 内存结构优化 (ZRAM & Swap)
-#   修改说明: 
-#     1. ZRAM 大小限制为 RAM 的 20% (原50%)，避免抢占 TCP 缓冲区。
-#     2. Swappiness 降为 10，优先使用物理内存，减少 CPU 上下文切换。
+#   模块 3-2: 内存结构优化 (ZRAM & Swap) - [深度修复版]
+#   [修复核心逻辑]
+#   1. ZRAM 限制: 仅在内存极小 (<512MB) 时开启。大流量下 ZRAM 的 CPU 消耗是网络卡顿的元凶。
+#   2. Swappiness: 强制锁定为 10。对于网络服务器，TCP 缓冲区必须驻留在物理内存，禁止被换出。
 # ==============================================================================
 optimize_memory() {
-    log_info "正在优化内存结构 (网络吞吐优先模式)..."
+    log_info "正在优化内存结构 (网络吞吐优先模式 / 修复长期衰减)..."
 
-    # --- 3.4 ZRAM 内存压缩 [逻辑重写 - 性能优先] ---
+    # --- 1. 获取物理内存大小 (MB) ---
     MEM_TOTAL_MB=$(free -m | awk '/Mem:/ {print $2}')
     HAS_ZRAM=0
     
-    # [修改] 阈值从 4096 改为 512。
-    # 对于跑大流量的机器，物理内存必须优先给 TCP Buffer，而不是被 ZRAM 拿去压缩消耗 CPU。
+    # --- 2. ZRAM 策略调整 (关键修复) ---
+    # 原逻辑: <4GB 都开 ZRAM。
+    # 新逻辑: >512MB 坚决不开 ZRAM。
+    # 原因: 网络吞吐需要 CPU 处理软中断。ZRAM 压缩内存也需要 CPU。两者竞争会导致网速随时间下降。
+    
     if [ "$MEM_TOTAL_MB" -gt 512 ]; then
         log_info "物理内存充足 (>512MB)，禁用 ZRAM 以消除 CPU 压缩开销，确保网络软中断算力。"
+        
+        # 如果之前开启过，现在关闭并清理
         if systemctl is-active zram >/dev/null 2>&1; then
             systemctl disable --now zram >/dev/null 2>&1
-            # 清理残留
-            rm -f /usr/local/bin/zram-start.sh /etc/systemd/system/zram.service
         fi
+        rm -f /usr/local/bin/zram-start.sh /etc/systemd/system/zram.service
         HAS_ZRAM=0
     else
-        # 仅针对极低内存机器开启
-        log_info "检测到微型内存环境 (<512MB)，启用轻量化 ZRAM..."
+        # 仅针对极低内存机器 (<512MB) 开启救急
+        log_info "检测到微型内存环境 (<512MB)，启用轻量化 ZRAM (lz4模式)..."
+        
+        # 检查内核模块
         if modprobe zram num_devices=1; then
+            # 等待设备节点生成
             if command -v udevadm >/dev/null 2>&1; then udevadm settle --timeout=5; else sleep 0.5; fi
             
+            # 如果未启用则配置
             if ! grep -q "zram" /proc/swaps; then
-                # 仅占用 20%
+                # 仅占用 20% 内存，避免挤占 TCP Buffer
                 ZRAM_SIZE=$(($MEM_TOTAL_MB / 5))
-                # 强制使用 lz4 (CPU消耗最低)
+                # 限制 ZRAM 大小范围 [64M, 512M]
+                if [ "$ZRAM_SIZE" -lt 64 ]; then ZRAM_SIZE=64; fi
+                
+                # 强制使用 lz4 算法 (CPU消耗最低，优于 zstd)
                 ALGO="lz4"
                 
+                # 生成启动脚本
                 cat > /usr/local/bin/zram-start.sh <<EOF
 #!/bin/bash
 modprobe zram num_devices=1
 sleep 0.5
+# 重置设备
 [ -f /sys/block/zram0/reset ] && echo 1 > /sys/block/zram0/reset 2>/dev/null
+# 设置压缩算法
 echo "$ALGO" > /sys/block/zram0/comp_algorithm 2>/dev/null
+# 设置大小
 echo "${ZRAM_SIZE}M" > /sys/block/zram0/disksize
+# 格式化并挂载
 mkswap /dev/zram0 >/dev/null 2>&1
 swapon -p 100 /dev/zram0
 EOF
                 chmod +x /usr/local/bin/zram-start.sh
                 
+                # 生成 Systemd 服务
                 cat > /etc/systemd/system/zram.service <<EOF
 [Unit]
 Description=SysPro Lightweight ZRAM
@@ -422,37 +439,50 @@ EOF
                 systemctl daemon-reload
                 systemctl enable zram --now >/dev/null 2>&1
                 HAS_ZRAM=1
-                log_success "ZRAM 已启用 (LZ4模式)。"
+                log_success "ZRAM 已启用 (大小: ${ZRAM_SIZE}MB, 算法: lz4)。"
             fi
+        else
+            log_warn "内核不支持 ZRAM 模块，跳过。"
         fi
     fi
     
-    # --- 3.5 Swappiness 优化 [关键] ---
-    # 强制设为 10 (或 1)。
-    # 网络服务器的大忌是 Swap 抖动。必须让数据包待在物理 RAM 里。
+    # --- 3. Swappiness 优化 (防止 TCP 被换出) ---
+    # 强制设为 10。无论内存多大，网络数据包处理都应在 RAM 中完成，避免磁盘 I/O 延迟。
     sysctl -w vm.swappiness=10 >/dev/null 2>&1
+    
+    # 持久化配置
     echo "vm.swappiness = 10" > /etc/sysctl.d/99-syspro-swap.conf
-    log_info "  - Swappiness 已锁定为 10 (拒绝 Swap 换页延迟)。"
+    log_info "  - Swappiness 已锁定为 10 (物理内存优先，拒绝 Swap 换页延迟)。"
     
-    # --- 3.6 保底磁盘 Swap ---
+    # --- 4. 保底磁盘 Swap (防止 OOM 死机) ---
+    # 检查是否已有 Swap
     CURRENT_SWAP_MB=$(free -m | awk '/Swap:/ {print $2}')
-    if [ "$CURRENT_SWAP_MB" -ge 128 ]; then
-        return
-    fi
-    # 内存足够大时完全不需要 Swap
-    if [ "$MEM_TOTAL_MB" -gt 4096 ]; then
+    
+    # 如果已有 Swap 或者物理内存大于 4GB，则不需要创建文件 Swap
+    if [ "$CURRENT_SWAP_MB" -ge 128 ] || [ "$MEM_TOTAL_MB" -gt 4096 ]; then
         return
     fi
     
-    log_warn "创建保底磁盘 Swap (1GB)..."
+    log_warn "系统无 Swap 且内存较小，正在创建保底 Swap (/swapfile 1GB)..."
     SIZE=1024
-    DISK_AVAIL=$(df -m / | awk 'NR==2 {print $4}')
-    if [ "$DISK_AVAIL" -lt 2048 ]; then return; fi
-
-    rm -f /swapfile && touch /swapfile
-    FS_TYPE=$(df -T /swapfile | tail -1 | awk '{print $2}')
-    if [ "$FS_TYPE" == "btrfs" ] && command -v chattr >/dev/null; then chattr +C /swapfile; fi
     
+    # 检查磁盘空间
+    DISK_AVAIL=$(df -m / | awk 'NR==2 {print $4}')
+    if [ "$DISK_AVAIL" -lt 2048 ]; then
+        log_err "磁盘空间不足，跳过 Swap 创建。"
+        return
+    fi
+
+    # 创建流程
+    rm -f /swapfile && touch /swapfile
+    
+    # 处理 Btrfs 文件系统
+    FS_TYPE=$(df -T /swapfile | tail -1 | awk '{print $2}')
+    if [ "$FS_TYPE" == "btrfs" ] && command -v chattr >/dev/null; then 
+        chattr +C /swapfile
+    fi
+    
+    # 分配空间
     if ! fallocate -l ${SIZE}M /swapfile 2>/dev/null; then
         dd if=/dev/zero of=/swapfile bs=1M count=$SIZE status=none
     fi
@@ -460,8 +490,13 @@ EOF
     chmod 600 /swapfile
     mkswap /swapfile >/dev/null 2>&1
     swapon /swapfile
-    if ! grep -q "/swapfile" /etc/fstab; then echo "/swapfile swap swap defaults 0 0" >> /etc/fstab; fi
-    log_success "保底 Swap 已创建。"
+    
+    # 写入 fstab
+    if ! grep -q "/swapfile" /etc/fstab; then 
+        echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
+    fi
+    
+    log_success "保底磁盘 Swap (1GB) 已创建。"
 }
 
 # ==============================================================================
