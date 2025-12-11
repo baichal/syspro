@@ -1000,8 +1000,9 @@ manual_tasks_menu() {
 }
 
 # ==============================================================================
-#   模块 8: 日志系统管理
-#   功能: 停止服务 -> 清空文件 -> 锁定权限 -> 内核静音 -> 创建标记
+#   模块 8: 日志系统管理 [修复版]
+#   功能: 停止服务 -> 解锁文件 -> 清空文件 -> 锁定权限 -> 内核静音
+#   修复: 增加预先解锁步骤，解决 "Operation not permitted" 报错
 # ==============================================================================
 optimize_logging_killer() {
     echo -e "${RED}================================================================${PLAIN}"
@@ -1009,31 +1010,29 @@ optimize_logging_killer() {
     echo -e "${RED} 此操作将导致系统失去所有错误记录能力，降低 IO 延迟。   ${PLAIN}"
     echo -e "${RED}================================================================${PLAIN}"
     
-    # 创建状态标记文件
+    # 1. 创建状态标记文件
     # 作用: 用于卸载程序识别日志系统曾被修改，执行恢复逻辑。
     touch /etc/syspro_logs_killed
     log_info "已创建状态标记: /etc/syspro_logs_killed"
 
-    # 步骤 1: 停止并禁用常见的日志与崩溃报告服务
-    # 作用: 释放被这些守护进程占用的内存和 CPU 时间片
+    # 2. 停止并禁用常见的日志与崩溃报告服务
     log_info "正在终止所有日志守护进程..."
-    # 定义服务列表：包括传统的 rsyslog, systemd日志, 以及崩溃转储工具 kdump/apport
+    # 定义服务列表
     local SERVICES=("rsyslog" "systemd-journald" "syslog" "rsyslogd" "kdump" "apport" "abrtd" "avahi-daemon")
     
     for svc in "${SERVICES[@]}"; do
-        # 检查服务是否存在或正在运行
+        # [优化] 增加 2>/dev/null 屏蔽 "Failed to get unit file state" 报错
         if systemctl is-active --quiet "$svc" || systemctl is-enabled --quiet "$svc"; then
             systemctl stop "$svc" 2>/dev/null
             systemctl disable "$svc" 2>/dev/null
-            # [重要] Mask (屏蔽) 服务：防止被其他依赖服务自动唤醒
             systemctl mask "$svc" 2>/dev/null
             log_info "  - 服务已停止并屏蔽: $svc"
         fi
     done
 
-    # 步骤 2: 配置 Journald 不记录日志
-    # 作用: 防止 systemd-journald 记录数据到磁盘或内存
+    # 3. 配置 Journald 不记录日志
     log_info "配置 systemd-journald 为黑洞模式..."
+    mkdir -p /etc/systemd
     cat > /etc/systemd/journald.conf << EOF
 [Journal]
 Storage=none
@@ -1043,38 +1042,46 @@ ForwardToConsole=no
 ForwardToWall=no
 EOF
 
-    # 步骤 3: 清理磁盘日志并锁定权限
-    # 作用: 删除现有日志文件，阻止未来的写入操作
+    # 4. 清理磁盘日志并锁定权限 [关键修复逻辑]
     log_info "正在清理并锁定 /var/log 目录..."
+
+    # [关键修复] 在操作前，必须先递归解锁！
+    # 否则如果文件已经被锁定，后续的 rm/touch/chmod 全都会报 "Operation not permitted"
+    if command -v chattr >/dev/null 2>&1; then
+        # 忽略解锁过程中的错误（比如文件不存在）
+        chattr -R -i /var/log >/dev/null 2>&1
+        log_info "  - 已解除旧的属性锁 (chattr -i)，准备清理..."
+    fi
     
-    # 3.1 递归删除 /var/log 下的所有文件
+    # 4.1 递归删除 /var/log 下的所有文件 (现在有权限删除了)
     find /var/log -type f -delete 2>/dev/null || true
     
-    # 3.2 重建关键的空文件 (伪装)
-    # 原因: 某些服务(如 sshd)登录时如果找不到 wtmp/btmp 会报错或拒绝登录
+    # 4.2 重建关键的空文件 (伪装)
+    # 某些服务(如 sshd/sudo) 如果找不到这些文件会报错
     touch /var/log/wtmp /var/log/btmp /var/log/lastlog /var/log/auth.log /var/log/syslog /var/log/messages
     
-    # 3.3 暴力清空内容 (双重保险)
+    # 4.3 确保内容为空
     cat /dev/null > /var/log/wtmp
     cat /dev/null > /var/log/btmp
     
-    # 3.4 修改文件系统权限
+    # 4.4 修改文件系统权限
     # 0555 = r-xr-xr-x (所有人只读/执行，不可写入)
     chmod -R 0555 /var/log
     
-    # 3.5 使用 chattr 设置不可变属性
+    # 4.5 使用 chattr 设置不可变属性 (上锁)
     # 作用: 防止文件被修改，包括 Root 用户
     if command -v chattr >/dev/null 2>&1; then
+        # 锁定具体文件
         chattr +i /var/log/wtmp /var/log/btmp /var/log/syslog /var/log/messages 2>/dev/null || true
-        # 尝试递归锁定整个目录 (可能会失败，忽略错误)
+        # 尝试递归锁定整个目录
         chattr -R +i /var/log 2>/dev/null || true
-        log_success "  - 文件系统锁 (chattr +i) 已施加。"
+        log_success "  - 文件系统锁 (chattr +i) 已重新施加。"
+    else
+        log_warn "未找到 chattr 命令，仅应用了 chmod 权限控制。"
     fi
 
-    # 步骤 4: 内核层静音 (Printk)
-    # 作用: 禁止内核向控制台打印消息，减少 CPU 中断
+    # 5. 内核层静音 (Printk)
     log_info "应用内核静音参数..."
-    # 备份现有配置 (如果不存在)
     if [ ! -f /etc/sysctl.d/95-syspro-silence.conf ]; then
         # printk: console_loglevel=0 (紧急消息也不打)
         echo "kernel.printk = 0 0 0 0" > /etc/sysctl.d/95-syspro-silence.conf
@@ -1083,15 +1090,14 @@ EOF
         sysctl -p /etc/sysctl.d/95-syspro-silence.conf >/dev/null 2>&1
     fi
 
-    # 步骤 5: 尝试重启 Journald 使配置生效
-    # 因为前面 Mask 了，这里可能启动失败，这是预期效果
+    # 6. 重启 Journald (应用黑洞配置)
     systemctl restart systemd-journald 2>/dev/null
 
     log_success "日志系统已配置完成。磁盘 IO 与 CPU 中断已释放。"
 }
 
 # ==============================================================================
-#   模块 9: 卸载 SysPro (完整回滚版 - 适配用户配置)
+#   模块 9: 卸载 SysPro (完整回滚版 - 适配用户配置) [修复完整版]
 #   功能: 恢复日志、还原 Docker 网络、清理旧版防火墙规则、重置 DNS
 # ==============================================================================
 uninstall_syspro() {
@@ -1101,28 +1107,37 @@ uninstall_syspro() {
     if [ -f "/etc/syspro_logs_killed" ]; then
         log_info "检测到日志系统曾被禁用，正在恢复..."
         
-        # 解锁文件系统不可变属性 (chattr -i)
-        command -v chattr >/dev/null 2>&1 && chattr -R -i /var/log 2>/dev/null
+        # [关键修复] 显式递归解锁文件系统不可变属性
+        # 必须在 chmod 之前执行，否则会被拒绝访问
+        if command -v chattr >/dev/null 2>&1; then 
+            log_info "  - 正在解除文件系统锁 (chattr -i)..."
+            chattr -R -i /var/log 2>/dev/null
+        fi
         
-        # 恢复目录权限
+        # 恢复目录标准权限 (755 = rwxr-xr-x)
         chmod -R 755 /var/log
         
         # 移除内核静音配置
         rm -f /etc/sysctl.d/95-syspro-silence.conf
         
         # 恢复 Journald 配置
-        if [ ! -s /etc/systemd/journald.conf ]; then
+        # 如果文件内容被清空或修改过，重置为系统默认推荐值
+        if [ -f /etc/systemd/journald.conf ]; then
+             # 恢复为自动存储，限制最大占用 200M
              echo -e "[Journal]\nStorage=auto\nSystemMaxUse=200M" > /etc/systemd/journald.conf
         fi
         
-        # 恢复基础服务
+        # 恢复基础日志服务
+        # 列表包含了常见的发行版日志守护进程
         local SERVICES=("rsyslog" "systemd-journald" "syslog" "kdump" "auditd" "avahi-daemon")
         for svc in "${SERVICES[@]}"; do
+            # Unmask 是关键，如果之前被 masked，直接 start 会失败
             systemctl unmask "$svc" 2>/dev/null
             systemctl enable "$svc" 2>/dev/null
             systemctl restart "$svc" 2>/dev/null
         done
         
+        # 删除状态标记文件
         rm -f /etc/syspro_logs_killed
         log_success "日志系统功能已恢复。"
     fi
@@ -1135,10 +1150,10 @@ uninstall_syspro() {
     rm -f /etc/systemd/system/syspro-doh.service
     rm -f /usr/local/bin/cloudflared 
     
-    # 2.2 清理防火墙规则
+    # 2.2 清理防火墙规则 (iptables)
     DEFAULT_IFACE=$(ip route | grep default | head -n1 | awk '{print $5}')
     if [ -n "$DEFAULT_IFACE" ] && command -v iptables >/dev/null; then
-        # 尝试删除 INPUT DROP 规则
+        # 尝试删除脚本添加的 DROP 规则
         iptables -D INPUT -i "$DEFAULT_IFACE" -p udp --dport 53 -j DROP 2>/dev/null
         iptables -D INPUT -i "$DEFAULT_IFACE" -p tcp --dport 53 -j DROP 2>/dev/null
         # 清理 Docker 相关的显式放行规则
@@ -1150,63 +1165,63 @@ uninstall_syspro() {
     # 2.3 还原 Docker 配置文件
     RESTART_DOCKER=0
     if [ -f /etc/docker/daemon.json.syspro.bak ]; then
-        # 场景A: 存在备份文件，直接还原 (最安全)
+        # 场景A: 存在脚本创建的备份文件，直接还原 (最安全)
         mv /etc/docker/daemon.json.syspro.bak /etc/docker/daemon.json
         log_info "已还原 Docker 原始 daemon.json 配置文件。"
         RESTART_DOCKER=1
     elif [ -f /etc/docker/daemon.json ]; then
         # 场景B: 无备份，但文件存在。
-        # 检查是否为脚本生成的简单单行配置
+        # 检查是否为脚本生成的简单单行配置 (包含 dns 且只有 1 行)
         if grep -q "dns" /etc/docker/daemon.json && [ $(wc -l < /etc/docker/daemon.json) -eq 1 ]; then
              rm -f /etc/docker/daemon.json
              log_info "已删除脚本生成的 Docker 配置文件。"
              RESTART_DOCKER=1
         else
-             log_warn "Docker 配置文件似乎被修改过，为安全起见未自动删除。请手动检查: /etc/docker/daemon.json"
+             log_warn "Docker 配置文件似乎被用户修改过，为数据安全起见未自动删除。请手动检查: /etc/docker/daemon.json"
         fi
     fi
 
     # --- 3. 修复系统 DNS (解决 Docker 断网核心) ---
     log_info "正在重置系统 DNS 配置..."
     
-    # 解锁 resolv.conf
+    # 解锁 resolv.conf (如果被锁)
     if command -v chattr >/dev/null 2>&1; then chattr -i /etc/resolv.conf 2>/dev/null; fi
     
-    # 辅助函数：使用用户配置生成默认 resolv.conf 内容
+    # 辅助函数：生成默认的保底 DNS (Google/Cloudflare)
+    # 避免卸载后无 DNS 可用
     gen_reset_resolv_conf() {
         echo "# SysPro Reset (Default)" > /etc/resolv.conf
-        while read -r ip; do
-            [[ -z "$ip" || "$ip" =~ ^# ]] && continue
-            echo "nameserver $ip" >> /etc/resolv.conf
-        done <<< "$DNS_IPV4_LIST"
+        echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+        echo "nameserver 1.1.1.1" >> /etc/resolv.conf
     }
 
     # 判断是否为 Ubuntu/Debian 等使用 systemd-resolved 的系统
     if systemctl list-unit-files | grep -q "systemd-resolved"; then
         
-        # 恢复服务 (关键: Unmask)
+        # 恢复服务 (关键: Unmask + Enable)
         systemctl unmask systemd-resolved 2>/dev/null
         systemctl enable --now systemd-resolved 2>/dev/null
         
         # [逻辑优化] 尝试恢复软链接
+        # Ubuntu 标准做法是 /etc/resolv.conf -> /run/systemd/resolve/stub-resolv.conf
         if [ -f /run/systemd/resolve/stub-resolv.conf ]; then
             rm -f /etc/resolv.conf
             ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
             log_success "/etc/resolv.conf 已恢复为标准软链接。"
         else
-            # 存根不存在，回退到用户配置的 DNS (不再强制 8.8.8.8)
+            # 存根不存在，回退到保底配置
             rm -f /etc/resolv.conf
             gen_reset_resolv_conf
-            log_warn "Systemd-resolved 存根未找到，已重置为用户配置列表。"
+            log_warn "Systemd-resolved 存根未找到，已重置为公共 DNS。"
         fi
         
         # 尝试重启 resolved 以重新生成配置
         systemctl restart systemd-resolved 2>/dev/null
     else
-        # CentOS 7 等老系统，直接重置为用户配置列表
+        # CentOS 7 等老系统，直接重置
         rm -f /etc/resolv.conf
         gen_reset_resolv_conf
-        log_success "DNS 已重置为用户配置列表。"
+        log_success "DNS 已重置为公共 DNS。"
     fi
 
     # 2.4 重启 Docker (应用配置还原)
@@ -1220,7 +1235,7 @@ uninstall_syspro() {
     systemctl disable --now zram >/dev/null 2>&1
     rm -f /usr/local/bin/zram-start.sh /etc/systemd/system/zram.service
     
-    # 清理内核参数
+    # 清理所有 SysPro 相关的内核参数文件
     rm -f /etc/sysctl.d/97-syspro-latency.conf
     rm -f /etc/sysctl.d/99-syspro-swap.conf
     rm -f /etc/sysctl.d/98-syspro-security.conf
@@ -1232,13 +1247,14 @@ uninstall_syspro() {
         cp /etc/fstab.syspro.bak /etc/fstab
         mount -o remount / 2>/dev/null
         rm -f /etc/fstab.syspro.bak
+        log_info "已恢复原始 fstab 文件。"
     fi
     
-    # 清理 Udev 规则
+    # 清理 Udev I/O 调度规则
     rm -f /etc/udev/rules.d/60-io-scheduler.rules
     if command -v udevadm >/dev/null 2>&1; then udevadm control --reload && udevadm trigger; fi
     
-    # 清理 Systemd 额外配置
+    # 清理 Systemd 额外配置 (OOM 保护等)
     rm -rf /etc/systemd/system/ssh.service.d /etc/systemd/system/sshd.service.d
     rm -f /etc/security/limits.d/99-disable-core.conf
     if [ -f /etc/systemd/system.conf.syspro.bak ]; then
@@ -1253,7 +1269,6 @@ uninstall_syspro() {
     echo -e "${GREEN}SysPro 已成功完全卸载。${PLAIN}"
     echo -e "${YELLOW}提示: Docker 配置已尝试还原，建议重启一次服务器以彻底重置内核状态。${PLAIN}"
 }
-
 show_menu() {
     clear
     echo -e "${BLUE}================================================================${PLAIN}"
