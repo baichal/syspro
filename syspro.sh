@@ -209,84 +209,50 @@ optimize_compute() {
     fi
 
     # --- 2.2 内核调度器参数重写 (CFS Tuning) ---
-    # [核心修改说明]
-    # 原参数 (3ms latency) 导致 Context Switch 过高，网络吞吐量上不去。
-    # 新参数 (15ms latency) 牺牲微秒级响应，换取更高的数据包处理能力 (PPS)。
+    # [核心修改] 添加 kernel.sched_autogroup_enabled = 0
+    # 这确保了无论 SSH 是否连接，进程都获得同等的 CPU 调度权重。
     
     cat > /etc/sysctl.d/97-syspro-latency.conf << EOF
-# 调度延迟周期 (Scheduler Latency)
-# 作用: 增加每个任务在 CPU 上的运行时间片，减少切换开销，提升 BBR 吞吐。
-kernel.sched_latency_ns = 4000000
+# 禁用调度器自动分组 (解决 SSH 断开后进程降速的核心参数)
+kernel.sched_autogroup_enabled = 0
 
-# 唤醒粒度 (Wakeup Granularity)
-# 原脚本: 0.5ms | 优化后: 2ms
-# 作用: 避免新唤醒的进程(如瞬间的网络中断)过于频繁地抢占正在处理数据的进程。
-# 降低唤醒粒度，允许新到达的网络包更快抢占 CPU
+# 调度延迟周期
+kernel.sched_latency_ns = 4000000
+# 唤醒粒度
 kernel.sched_wakeup_granularity_ns = 500000
 kernel.sched_min_granularity_ns = 100000
-
-# 迁移成本 (Migration Cost)
-# 原脚本: 0.25ms | 优化后: 0.5ms
-# 作用: 告诉内核“移动任务到另一个核心的代价很高”，
-# 这会鼓励内核让网络中断处理程序留在同一个核心上，利用 L1/L2 缓存加速数据包处理。
-# 降低迁移成本，允许网络任务在空闲核心间快速转移
+# 迁移成本
 kernel.sched_migration_cost_ns = 250000
-
-# 禁用 RT 节流 (Realtime Throttling)
-# 设置为 950000 (保留 5% CPU 给系统保活进程)，防止 Watchdog 在极端死循环下无法唤醒。
-# 原设置为 -1 (完全禁用) 在极少数单核机器上可能导致死机。
+# 禁用 RT 节流
 kernel.sched_rt_runtime_us = 950000
 EOF
     sysctl -p /etc/sysctl.d/97-syspro-latency.conf >/dev/null 2>&1
-    log_success "内核 CFS 调度器已优化 (Throughput Optimized / 15ms)。"
+    log_success "内核 CFS 调度器已优化 (Autogroup Disabled / 15ms)。"
 
     # --- 2.3 CPU 模式锁定与 C-State 禁用 ---
-    # 目标: 锁定 Performance 模式，减少 CPU 变频带来的延迟
+    # [修改] 移除虚拟化检测限制，强制对所有环境尝试锁定频率。
+    # 因为很多 KVM VPS 实际上允许客户机调整 governor。
+    log_info "正在锁定 CPU 频率为 Performance 模式..."
     
-    IS_VIRTUAL="false"
-    if command -v systemd-detect-virt >/dev/null 2>&1; then
-        VIRT_TECH=$(systemd-detect-virt)
-        # 排除物理机(none)和部分允许调优的虚拟机
-        if [[ "$VIRT_TECH" != "none" && "$VIRT_TECH" != "kvm" && "$VIRT_TECH" != "oracle" ]]; then
-            IS_VIRTUAL="true"
-        fi
+    # 方法 A: 使用 cpupower (如果可用)
+    if command -v cpupower >/dev/null 2>&1; then
+        cpupower frequency-set -g performance >/dev/null 2>&1
+        cpupower idle-set -D 2 >/dev/null 2>&1
     fi
-
-    if [[ "$IS_VIRTUAL" == "false" ]]; then
-        # 1. 安装电源管理工具 cpupower
-        if ! command -v cpupower >/dev/null 2>&1; then
-            smart_pkg_update
-            if [[ "${RELEASE}" == "centos" ]]; then 
-                yum install -y kernel-tools >/dev/null 2>&1
-            else 
-                apt-get install -y linux-cpupower cpufrequtils >/dev/null 2>&1
-            fi
+    
+    # 方法 B: 直接修改 Sysfs (更可靠，适配所有 Linux 发行版)
+    # 强制遍历所有核心，写入 performance
+    local success_count=0
+    for cpu_gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+        if [ -w "$cpu_gov" ]; then
+            echo "performance" > "$cpu_gov" 2>/dev/null && ((success_count++))
         fi
-        
-        # 2. 执行调优
-        if command -v cpupower >/dev/null 2>&1; then
-            # A. 锁定 Performance 频率 (P-State): 保持最高主频
-            cpupower frequency-set -g performance >/dev/null 2>&1
-            
-            # B. 禁用 C-States (Idle State)
-            # [修改] 只禁用 C2 及以上的深度睡眠，保留 C0/C1。
-            # 完全禁用(如 -D 1)可能导致 CPU 在空闲时过热降频，保留 C1 可平衡发热与响应。
-            cpupower idle-set -D 2 >/dev/null 2>&1
-            log_success "CPU 频率已锁定 (Performance)，已禁用深度睡眠 (C2+)。"
-        else
-            # C. 回退方案: 直接修改 Sysfs
-            local success_count=0
-            for cpu_gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-                if [ -w "$cpu_gov" ]; then
-                    echo "performance" > "$cpu_gov" 2>/dev/null && ((success_count++))
-                fi
-            done
-            if [ "$success_count" -gt 0 ]; then
-                log_success "已通过 Sysfs 锁定 $success_count 个核心频率。"
-            fi
-        fi
+    done
+    
+    if [ "$success_count" -gt 0 ]; then
+        log_success "已强制锁定 $success_count 个核心为 Performance 模式。"
     else
-        log_info "检测到受限虚拟化环境 ($VIRT_TECH)，跳过 CPU 硬件层调优。"
+        log_warn "无法修改 CPU 频率 (可能受母机限制)，已尝试但无权操作。"
     fi
 }
 
