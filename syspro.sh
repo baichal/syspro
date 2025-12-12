@@ -221,13 +221,15 @@ kernel.sched_latency_ns = 4000000
 # 唤醒粒度 (Wakeup Granularity)
 # 原脚本: 0.5ms | 优化后: 2ms
 # 作用: 避免新唤醒的进程(如瞬间的网络中断)过于频繁地抢占正在处理数据的进程。
-kernel.sched_wakeup_granularity_ns = 1000000
-kernel.sched_min_granularity_ns = 1000000
+# 降低唤醒粒度，允许新到达的网络包更快抢占 CPU
+kernel.sched_wakeup_granularity_ns = 500000
+kernel.sched_min_granularity_ns = 100000
 
 # 迁移成本 (Migration Cost)
 # 原脚本: 0.25ms | 优化后: 0.5ms
 # 作用: 告诉内核“移动任务到另一个核心的代价很高”，
 # 这会鼓励内核让网络中断处理程序留在同一个核心上，利用 L1/L2 缓存加速数据包处理。
+# 降低迁移成本，允许网络任务在空闲核心间快速转移
 kernel.sched_migration_cost_ns = 250000
 
 # 禁用 RT 节流 (Realtime Throttling)
@@ -354,6 +356,26 @@ EOF
     if [ -f /usr/local/bin/oom-protect.sh ]; then
         rm -f /usr/local/bin/oom-protect.sh
         crontab -l 2>/dev/null | grep -v "oom-protect" | crontab -
+    fi
+
+    # --- 3.4 防止断开 SSH 后杀后台进程 (logind) ---
+    # 作用: 默认情况下，用户退出 SSH 后，systemd 可能会清理属于该用户的进程。
+    # 修改此项可确保后台高吞吐任务不会被限速或误杀。
+    log_info "优化 Systemd 用户会话保留策略 (KillUserProcesses=no)..."
+    
+    if [ -f /etc/systemd/logind.conf ]; then
+        # 1. 备份原文件
+        [ ! -f /etc/systemd/logind.conf.syspro.bak ] && cp /etc/systemd/logind.conf /etc/systemd/logind.conf.syspro.bak
+        
+        # 2. 修改配置 (取消注释并强制设为 no)
+        sed -i 's/^#\?KillUserProcesses.*/KillUserProcesses=no/' /etc/systemd/logind.conf
+        
+        # 3. 重启 logind 服务使配置生效
+        # 注意: 这通常不会断开当前的 SSH 连接，但会应用新策略
+        systemctl restart systemd-logind
+        log_success "Logind 策略已更新: 后台任务将常驻。"
+    else
+        log_warn "未找到 /etc/systemd/logind.conf，跳过会话策略优化。"
     fi
 
     systemctl daemon-reload
@@ -1258,6 +1280,13 @@ uninstall_syspro() {
     rm -f /etc/security/limits.d/99-disable-core.conf
     if [ -f /etc/systemd/system.conf.syspro.bak ]; then
         cp /etc/systemd/system.conf.syspro.bak /etc/systemd/system.conf
+    fi
+
+    # 还原 logind 配置
+    if [ -f /etc/systemd/logind.conf.syspro.bak ]; then
+        mv /etc/systemd/logind.conf.syspro.bak /etc/systemd/logind.conf
+        systemctl restart systemd-logind
+        log_info "已恢复原始 logind.conf 配置。"
     fi
     
     # --- 5. 刷新系统状态 ---
