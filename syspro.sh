@@ -215,21 +215,20 @@ optimize_compute() {
     
     cat > /etc/sysctl.d/97-syspro-latency.conf << EOF
 # 调度延迟周期 (Scheduler Latency)
-# 默认: 24ms | 原脚本: 3ms (桌面级) | 优化后: 15ms (网络服务器级)
 # 作用: 增加每个任务在 CPU 上的运行时间片，减少切换开销，提升 BBR 吞吐。
-kernel.sched_latency_ns = 15000000
+kernel.sched_latency_ns = 4000000
 
 # 唤醒粒度 (Wakeup Granularity)
 # 原脚本: 0.5ms | 优化后: 2ms
 # 作用: 避免新唤醒的进程(如瞬间的网络中断)过于频繁地抢占正在处理数据的进程。
-kernel.sched_wakeup_granularity_ns = 2000000
-kernel.sched_min_granularity_ns = 2000000
+kernel.sched_wakeup_granularity_ns = 1000000
+kernel.sched_min_granularity_ns = 1000000
 
 # 迁移成本 (Migration Cost)
 # 原脚本: 0.25ms | 优化后: 0.5ms
 # 作用: 告诉内核“移动任务到另一个核心的代价很高”，
 # 这会鼓励内核让网络中断处理程序留在同一个核心上，利用 L1/L2 缓存加速数据包处理。
-kernel.sched_migration_cost_ns = 500000
+kernel.sched_migration_cost_ns = 250000
 
 # 禁用 RT 节流 (Realtime Throttling)
 # 设置为 950000 (保留 5% CPU 给系统保活进程)，防止 Watchdog 在极端死循环下无法唤醒。
