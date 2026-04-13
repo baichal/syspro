@@ -499,6 +499,8 @@ kernel.kptr_restrict = 2
 kernel.dmesg_restrict = 1
 # 禁用 SysRq 魔术键 (仅保留 Sync)
 kernel.sysrq = 16
+# 禁止响应 ICMP ping
+net.ipv4.icmp_echo_ignore_all = 1
 EOF
     sysctl -p /etc/sysctl.d/98-syspro-security.conf >/dev/null 2>&1
     log_success "内核安全参数已加载。"
