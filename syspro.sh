@@ -718,30 +718,8 @@ EOF
 }
 
 # ==============================================================================
-#   模块 5: 辅助函数 - Cloudflared 安装与启动 (修复 Docker 稳定性版)
+#   模块 5: 辅助函数 - Cloudflared 安装与启动
 # ==============================================================================
-
-# 辅助函数：将用户配置的 DNS 列表转换为 Docker 兼容的 JSON 格式
-# 输入: DNS_IPV4_LIST 变量
-# 输出: "1.1.1.1", "8.8.8.8" 格式字符串
-get_docker_dns_string() {
-    local json_str=""
-    while read -r line; do
-        # 过滤空行和注释
-        [[ -z "$line" || "$line" =~ ^# ]] && continue
-        if [ -z "$json_str" ]; then
-            json_str="\"$line\""
-        else
-            json_str="$json_str, \"$line\""
-        fi
-    done <<< "$DNS_IPV4_LIST"
-    
-    # 如果配置为空，提供保底
-    if [ -z "$json_str" ]; then
-        json_str="\"8.8.8.8\", \"1.1.1.1\""
-    fi
-    echo "$json_str"
-}
 
 install_cloudflared() {
     log_info "开始部署 Cloudflared DoH 客户端 (容器稳定性增强版)..."
@@ -804,7 +782,7 @@ EOF
         return 1
     fi
 
-    # --- 5. 处理端口冲突 (保持不变) ---
+    # --- 5. 处理端口冲突 ---
     if systemctl is-active systemd-resolved >/dev/null 2>&1 || systemctl is-enabled systemd-resolved >/dev/null 2>&1; then
         systemctl stop systemd-resolved
         systemctl disable systemd-resolved
@@ -812,35 +790,7 @@ EOF
         rm -f /etc/resolv.conf
     fi
 
-    # --- 6. 自动配置 Docker (关键修复) ---
-    if command -v docker >/dev/null 2>&1; then
-        log_info "正在优化 Docker DNS 配置..."
-        
-        # 获取 docker0 网桥 IP (DoH入口)
-        DOCKER_IP=$(ip -4 addr show docker0 2>/dev/null | grep -oP '(?<=inet\s)\d+(\.\d+){3}' | head -n 1)
-        
-        # 获取用户配置的备用 DNS 列表
-        BACKUP_DNS_LIST=$(get_docker_dns_string)
-        
-        mkdir -p /etc/docker
-        [ -f /etc/docker/daemon.json ] && cp /etc/docker/daemon.json /etc/docker/daemon.json.syspro.bak
-        
-        # [逻辑说明]
-        # 优先使用宿主机 DoH ($DOCKER_IP) 享受防劫持。
-        # 紧接着填入用户配置的 DNS ($BACKUP_DNS_LIST) 作为备选。
-        # 解决单点故障：如果 cloudflared 挂了/慢了，Docker 会自动切换到直连 IP。
-        if [ -n "$DOCKER_IP" ]; then
-             echo "{ \"dns\": [\"$DOCKER_IP\", $BACKUP_DNS_LIST] }" > /etc/docker/daemon.json
-             log_success "Docker DNS 已设置: 优先 DoH (宿主机), 备用: 用户自定义列表"
-        else
-             # 获取不到网桥IP，直接用配置列表
-             echo "{ \"dns\": [$BACKUP_DNS_LIST] }" > /etc/docker/daemon.json
-             log_warn "未获取到 Docker 网桥 IP，Docker DNS 将仅使用直连列表。"
-        fi
-        SYSTEM_DOCKER_RESTART_NEEDED=1
-    fi
-
-    # --- 7. 启动服务 (保持不变) ---
+    # --- 6. 启动服务 ---
     systemctl daemon-reload
     systemctl enable syspro-doh >/dev/null 2>&1
     systemctl restart syspro-doh
@@ -852,14 +802,7 @@ EOF
     done
     
     if [ $started -eq 1 ]; then
-        log_success "DoH 服务启动成功。"
-        if [ "$SYSTEM_DOCKER_RESTART_NEEDED" == "1" ]; then
-            if ! systemctl reload docker 2>/dev/null; then
-                log_warn "Docker 配置已保存，将在下次重启后生效。"
-            else
-                log_success "Docker DNS 配置已更新。"
-            fi
-        fi
+        log_success "DoH 服务启动成功。Docker 容器将自动使用宿主机 DNS。"
         return 0
     else
         log_err "DoH 启动超时。"
@@ -932,8 +875,6 @@ configure_dns() {
         systemctl disable syspro-doh
     fi
 
-    USER_DNS_JSON=$(get_docker_dns_string)
-
     if [[ "$DNS_CHOICE" == "2" ]]; then
         if install_cloudflared; then
             rm -f /etc/resolv.conf
@@ -941,7 +882,7 @@ configure_dns() {
             echo "nameserver 127.0.0.1" >> /etc/resolv.conf
             echo "options timeout:$DNS_TIMEOUT attempts:$DNS_ATTEMPTS" >> /etc/resolv.conf
             chattr +i /etc/resolv.conf
-            log_success "DoH 模式已生效 (宿主机: 127.0.0.1, Docker: 混合模式)。"
+            log_success "DoH 模式已生效。Docker 容器将自动使用宿主机 DNS。"
         else
             log_warn "DoH 安装失败，自动回退到标准 UDP 模式。"
             DNS_CHOICE="1"
@@ -966,18 +907,6 @@ configure_dns() {
         
         echo "options timeout:$DNS_TIMEOUT attempts:$DNS_ATTEMPTS rotate" >> /etc/resolv.conf
         chattr +i /etc/resolv.conf
-        
-        if command -v docker >/dev/null 2>&1; then
-            mkdir -p /etc/docker
-            [ -f /etc/docker/daemon.json ] && cp /etc/docker/daemon.json /etc/docker/daemon.json.syspro.bak
-            echo "{ \"dns\": [$USER_DNS_JSON] }" > /etc/docker/daemon.json
-            log_info "正在重新加载 Docker 配置 (sIGHUP)..."
-            if ! systemctl reload docker 2>/dev/null; then
-                log_warn "Docker 配置已保存，将在下次重启后生效。当前运行的容器不受影响。"
-            else
-                log_success "Docker DNS 配置已更新。"
-            fi
-        fi
         
         log_success "标准 DNS 模式已生效。"
     fi
@@ -1427,27 +1356,8 @@ uninstall_syspro() {
         iptables -D INPUT -i docker0 -p tcp --dport 53 -j ACCEPT 2>/dev/null
         log_info "防火墙规则清理尝试完成。"
     fi
-    
-    # 2.3 还原 Docker 配置文件
-    RESTART_DOCKER=0
-    if [ -f /etc/docker/daemon.json.syspro.bak ]; then
-        # 场景A: 存在脚本创建的备份文件，直接还原 (最安全)
-        mv /etc/docker/daemon.json.syspro.bak /etc/docker/daemon.json
-        log_info "已还原 Docker 原始 daemon.json 配置文件。"
-        RESTART_DOCKER=1
-    elif [ -f /etc/docker/daemon.json ]; then
-        # 场景B: 无备份，但文件存在。
-        # 检查是否为脚本生成的简单单行配置 (包含 dns 且只有 1 行)
-        if grep -q "dns" /etc/docker/daemon.json && [ $(wc -l < /etc/docker/daemon.json) -eq 1 ]; then
-             rm -f /etc/docker/daemon.json
-             log_info "已删除脚本生成的 Docker 配置文件。"
-             RESTART_DOCKER=1
-        else
-             log_warn "Docker 配置文件似乎被用户修改过，为数据安全起见未自动删除。请手动检查: /etc/docker/daemon.json"
-        fi
-    fi
 
-    # --- 3. 修复系统 DNS (解决 Docker 断网核心) ---
+    # --- 3. 修复系统 DNS ---
     log_info "正在重置系统 DNS 配置..."
     
     # 解锁 resolv.conf (如果被锁)
@@ -1488,15 +1398,6 @@ uninstall_syspro() {
         rm -f /etc/resolv.conf
         gen_reset_resolv_conf
         log_success "DNS 已重置为公共 DNS。"
-    fi
-
-    # 2.4 重启 Docker (应用配置还原)
-    if [[ "$RESTART_DOCKER" == "1" ]] && systemctl is-active docker >/dev/null 2>&1; then
-        if ! systemctl reload docker 2>/dev/null; then
-            log_warn "Docker 配置已保存，将在下次重启后生效。"
-        else
-            log_success "Docker 网络配置已回滚。"
-        fi
     fi
 
     # --- 4. 清理常规优化组件 ---
