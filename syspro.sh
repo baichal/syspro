@@ -854,8 +854,11 @@ EOF
     if [ $started -eq 1 ]; then
         log_success "DoH 服务启动成功。"
         if [ "$SYSTEM_DOCKER_RESTART_NEEDED" == "1" ]; then
-            systemctl restart docker
-            log_success "Docker 服务已重启，DNS 配置已生效。"
+            if ! systemctl reload docker 2>/dev/null; then
+                log_warn "Docker 配置已保存，将在下次重启后生效。"
+            else
+                log_success "Docker DNS 配置已更新。"
+            fi
         fi
         return 0
     else
@@ -968,9 +971,12 @@ configure_dns() {
             mkdir -p /etc/docker
             [ -f /etc/docker/daemon.json ] && cp /etc/docker/daemon.json /etc/docker/daemon.json.syspro.bak
             echo "{ \"dns\": [$USER_DNS_JSON] }" > /etc/docker/daemon.json
-            log_info "正在重启 Docker 以应用稳定的 DNS 配置..."
-            systemctl restart docker
-            log_success "Docker DNS 已强制同步为用户配置列表 (无 DoH 代理)。"
+            log_info "正在重新加载 Docker 配置 (sIGHUP)..."
+            if ! systemctl reload docker 2>/dev/null; then
+                log_warn "Docker 配置已保存，将在下次重启后生效。当前运行的容器不受影响。"
+            else
+                log_success "Docker DNS 配置已更新。"
+            fi
         fi
         
         log_success "标准 DNS 模式已生效。"
@@ -1486,8 +1492,11 @@ uninstall_syspro() {
 
     # 2.4 重启 Docker (应用配置还原)
     if [[ "$RESTART_DOCKER" == "1" ]] && systemctl is-active docker >/dev/null 2>&1; then
-        systemctl restart docker
-        log_success "Docker 服务已重启，网络配置已回滚。"
+        if ! systemctl reload docker 2>/dev/null; then
+            log_warn "Docker 配置已保存，将在下次重启后生效。"
+        else
+            log_success "Docker 网络配置已回滚。"
+        fi
     fi
 
     # --- 4. 清理常规优化组件 ---
