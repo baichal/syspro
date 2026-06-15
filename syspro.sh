@@ -1281,6 +1281,223 @@ EOF
 #   模块 9: 卸载 SysPro (完整回滚版 - 适配用户配置) [修复完整版]
 #   功能: 恢复日志、还原 Docker 网络、清理旧版防火墙规则、重置 DNS
 # ==============================================================================
+# ==============================================================================
+#   卸载辅助函数 - 卸载逻辑组件
+# ==============================================================================
+
+# 通用配置恢复函数
+# 参数: $1 = 备份文件路径, $2 = 目标文件路径, $3 = 描述
+restore_from_backup() {
+    local backup_file="$1"
+    local target_file="$2"
+    local desc="$3"
+    
+    if [ -f "$backup_file" ]; then
+        if cp "$backup_file" "$target_file" 2>/dev/null; then
+            rm -f "$backup_file"
+            log_info "已恢复${desc}"
+            return 0
+        else
+            log_err "恢复${desc}失败"
+            return 1
+        fi
+    fi
+    return 1
+}
+
+# 恢复日志系统
+restore_logging() {
+    if [ ! -f "/etc/syspro_logs_killed" ]; then
+        return 0
+    fi
+    
+    log_info "检测到日志系统曾被禁用，正在恢复..."
+    
+    if command -v chattr >/dev/null 2>&1; then
+        chattr -R -i /var/log 2>/dev/null
+    fi
+    
+    chmod -R 755 /var/log
+    
+    rm -f /etc/sysctl.d/95-syspro-silence.conf
+    rm -f /etc/profile.d/syspro-silent.sh
+    
+    if [ -f /etc/systemd/journald.conf ]; then
+        echo -e "[Journal]\nStorage=auto\nSystemMaxUse=200M" > /etc/systemd/journald.conf
+    fi
+    
+    local SERVICES=("rsyslog" "systemd-journald" "syslog" "kdump" "auditd" "avahi-daemon")
+    for svc in "${SERVICES[@]}"; do
+        systemctl unmask "$svc" 2>/dev/null
+        systemctl enable "$svc" 2>/dev/null
+        systemctl restart "$svc" 2>/dev/null
+    done
+    
+    rm -f /etc/syspro_logs_killed
+    log_success "系统日志功能已恢复"
+    return 0
+}
+
+# 清理网络组件
+cleanup_network() {
+    log_info "正在清理网络组件..."
+    local errors=0
+    
+    # 移除 DoH 服务
+    if [ -f /etc/systemd/system/syspro-doh.service ]; then
+        systemctl disable --now syspro-doh >/dev/null 2>&1
+        rm -f /etc/systemd/system/syspro-doh.service
+        rm -f /usr/local/bin/cloudflared
+        log_info "  - DoH 服务已移除"
+    fi
+    
+    # 清理防火墙规则
+    local DEFAULT_IFACE=$(ip route | grep default | head -n1 | awk '{print $5}')
+    if [ -n "$DEFAULT_IFACE" ] && command -v iptables >/dev/null 2>&1; then
+        iptables -D INPUT -i "$DEFAULT_IFACE" -p udp --dport 53 -j DROP 2>/dev/null
+        iptables -D INPUT -i "$DEFAULT_IFACE" -p tcp --dport 53 -j DROP 2>/dev/null
+        iptables -D INPUT -i docker0 -p udp --dport 53 -j ACCEPT 2>/dev/null
+        iptables -D INPUT -i docker0 -p tcp --dport 53 -j ACCEPT 2>/dev/null
+        log_info "  - 防火墙规则已清理"
+    fi
+    
+    # 恢复 SSH 配置
+    if [ -f /etc/ssh/sshd_config.syspro.bak ]; then
+        cp /etc/ssh/sshd_config.syspro.bak /etc/ssh/sshd_config
+        rm -f /etc/ssh/sshd_config.syspro.bak
+        if systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null; then
+            log_info "  - SSH 配置已恢复"
+        fi
+    fi
+    
+    # 恢复 Shell 环境
+    rm -f /etc/profile.d/syspro.sh
+    
+    return $errors
+}
+
+# 恢复系统 DNS
+restore_dns() {
+    log_info "正在重置系统 DNS 配置..."
+    
+    if command -v chattr >/dev/null 2>&1; then
+        chattr -i /etc/resolv.conf 2>/dev/null
+    fi
+    
+    gen_default_resolv_conf() {
+        echo "# SysPro Reset - 恢复为默认 DNS" > /etc/resolv.conf
+        echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+        echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+    }
+
+    if systemctl list-unit-files | grep -q "systemd-resolved"; then
+        systemctl unmask systemd-resolved 2>/dev/null
+        systemctl enable --now systemd-resolved 2>/dev/null
+        
+        if [ -f /run/systemd/resolve/stub-resolv.conf ]; then
+            rm -f /etc/resolv.conf
+            ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+            log_info "  - /etc/resolv.conf 已恢复为 systemd-resolved 软链接"
+        else
+            rm -f /etc/resolv.conf
+            gen_default_resolv_conf
+            log_warn "  - systemd-resolved 存根未找到，已重置为公共 DNS"
+        fi
+        
+        systemctl restart systemd-resolved 2>/dev/null
+    else
+        rm -f /etc/resolv.conf
+        gen_default_resolv_conf
+        log_info "  - 已重置为公共 DNS"
+    fi
+    
+    return 0
+}
+
+# 清理常规优化配置
+cleanup_optimizations() {
+    log_info "正在清理优化配置..."
+    
+    # ZRAM
+    if [ -f /etc/systemd/system/zram.service ]; then
+        systemctl disable --now zram >/dev/null 2>&1
+        rm -f /usr/local/bin/zram-start.sh /etc/systemd/system/zram.service
+        log_info "  - ZRAM 已移除"
+    fi
+    
+    # 内核参数文件
+    local sysctl_files=(
+        "/etc/sysctl.d/97-syspro-latency.conf"
+        "/etc/sysctl.d/99-syspro-swap.conf"
+        "/etc/sysctl.d/98-syspro-security.conf"
+        "/etc/sysctl.d/96-no-audit.conf"
+    )
+    local sysctl_removed=0
+    for f in "${sysctl_files[@]}"; do
+        if [ -f "$f" ]; then
+            rm -f "$f"
+            sysctl_removed=$((sysctl_removed + 1))
+        fi
+    done
+    if [ "$sysctl_removed" -gt 0 ]; then
+        log_info "  - 已移除 $sysctl_removed 个内核参数文件"
+    fi
+    
+    # Swap
+    if [ -f "/swapfile" ]; then
+        swapoff /swapfile 2>/dev/null
+        rm -f /swapfile
+        log_info "  - Swap 文件已移除"
+    fi
+    
+    # fstab
+    restore_from_backup "/etc/fstab.syspro.bak" "/etc/fstab" "fstab 配置" && mount -o remount / 2>/dev/null
+    
+    # Udev 规则
+    if [ -f /etc/udev/rules.d/60-io-scheduler.rules ]; then
+        rm -f /etc/udev/rules.d/60-io-scheduler.rules
+        if command -v udevadm >/dev/null 2>&1; then
+            udevadm control --reload && udevadm trigger 2>/dev/null
+        fi
+        log_info "  - Udev I/O 调度规则已恢复"
+    fi
+    
+    # Systemd 额外配置
+    rm -rf /etc/systemd/system/ssh.service.d /etc/systemd/system/sshd.service.d
+    rm -f /etc/security/limits.d/99-disable-core.conf
+    restore_from_backup "/etc/systemd/system.conf.syspro.bak" "/etc/systemd/system.conf" "Systemd 主配置"
+    
+    # Logind
+    if [ -f /etc/systemd/logind.conf.syspro.bak ]; then
+        mv /etc/systemd/logind.conf.syspro.bak /etc/systemd/logind.conf
+        systemctl restart systemd-logind 2>/dev/null
+        log_info "  - Logind 配置已恢复"
+    fi
+    
+    return 0
+}
+
+# 显示卸载摘要
+show_uninstall_summary() {
+    echo ""
+    echo -e "${GREEN}----------------------------------------------------------------${PLAIN}"
+    echo -e "${GREEN} SysPro 卸载完成${PLAIN}"
+    echo -e "${GREEN}----------------------------------------------------------------${PLAIN}"
+    echo ""
+    echo "  已执行的操作："
+    echo "    1. 系统日志 - 已恢复 (如曾被禁用)"
+    echo "    2. 网络组件 - DoH 服务与防火墙规则已清理"
+    echo "    3. DNS 配置 - 已重置为系统默认"
+    echo "    4. SSH 配置 - 已从备份恢复 (如存在)"
+    echo "    5. I/O 优化 - Udev 规则已恢复"
+    echo "    6. 系统优化 - 内核参数、fstab、ZRAM 已清理"
+    echo "    7. Systemd 配置 - 主配置与 logind 已恢复"
+    echo ""
+    echo -e "${YELLOW}建议: 重启服务器以确保所有内核状态完全重置。${PLAIN}"
+    echo -e "${GREEN}----------------------------------------------------------------${PLAIN}"
+    echo ""
+}
+
 uninstall_syspro() {
     echo -e "${RED}================================================================${PLAIN}"
     echo -e "${RED} [警告] 卸载 SysPro 及所有扩展组件         ${PLAIN}"
@@ -1300,151 +1517,26 @@ uninstall_syspro() {
         return 0
     fi
     
-    # --- 1. 恢复日志系统 (如果曾被禁用) ---
-    if [ -f "/etc/syspro_logs_killed" ]; then
-        log_info "检测到日志系统曾被禁用，正在恢复..."
-        
-        # 解除文件系统锁
-        if command -v chattr >/dev/null 2>&1; then 
-            log_info "  - 正在解除文件系统锁 (chattr -i)..."
-            chattr -R -i /var/log 2>/dev/null
-        fi
-        
-        # 恢复目录标准权限
-        chmod -R 755 /var/log
-        
-        # 移除内核静音配置
-        rm -f /etc/sysctl.d/95-syspro-silence.conf
-        
-        # 移除系统日志级别配置文件
-        rm -f /etc/profile.d/syspro-silent.sh
-        
-        # 恢复 Journald 配置
-        if [ -f /etc/systemd/journald.conf ]; then
-             echo -e "[Journal]\nStorage=auto\nSystemMaxUse=200M" > /etc/systemd/journald.conf
-        fi
-        
-        # 恢复基础日志服务
-        local SERVICES=("rsyslog" "systemd-journald" "syslog" "kdump" "auditd" "avahi-daemon")
-        for svc in "${SERVICES[@]}"; do
-            systemctl unmask "$svc" 2>/dev/null
-            systemctl enable "$svc" 2>/dev/null
-            systemctl restart "$svc" 2>/dev/null
-        done
-        
-        # 删除状态标记文件
-        rm -f /etc/syspro_logs_killed
-        log_success "系统日志功能已恢复，应用日志不受影响。"
-    fi
-
-    # --- 2. 清理网络组件与安全规则 ---
-    log_info "正在清理网络组件与安全规则..."
+    echo ""
     
-    # 2.1 移除 DoH 服务
-    systemctl disable --now syspro-doh >/dev/null 2>&1
-    rm -f /etc/systemd/system/syspro-doh.service
-    rm -f /usr/local/bin/cloudflared 
+    # --- 1. 恢复日志系统 ---
+    restore_logging
     
-    # 2.2 清理防火墙规则 (iptables)
-    DEFAULT_IFACE=$(ip route | grep default | head -n1 | awk '{print $5}')
-    if [ -n "$DEFAULT_IFACE" ] && command -v iptables >/dev/null; then
-        # 尝试删除脚本添加的 DROP 规则
-        iptables -D INPUT -i "$DEFAULT_IFACE" -p udp --dport 53 -j DROP 2>/dev/null
-        iptables -D INPUT -i "$DEFAULT_IFACE" -p tcp --dport 53 -j DROP 2>/dev/null
-        # 清理 Docker 相关的显式放行规则
-        iptables -D INPUT -i docker0 -p udp --dport 53 -j ACCEPT 2>/dev/null
-        iptables -D INPUT -i docker0 -p tcp --dport 53 -j ACCEPT 2>/dev/null
-        log_info "防火墙规则清理尝试完成。"
-    fi
-
+    # --- 2. 清理网络组件 ---
+    cleanup_network
+    
     # --- 3. 修复系统 DNS ---
-    log_info "正在重置系统 DNS 配置..."
+    restore_dns
     
-    # 解锁 resolv.conf (如果被锁)
-    if command -v chattr >/dev/null 2>&1; then chattr -i /etc/resolv.conf 2>/dev/null; fi
-    
-    # 辅助函数：生成默认的保底 DNS (Google/Cloudflare)
-    # 避免卸载后无 DNS 可用
-    gen_reset_resolv_conf() {
-        echo "# SysPro Reset (Default)" > /etc/resolv.conf
-        echo "nameserver 8.8.8.8" >> /etc/resolv.conf
-        echo "nameserver 1.1.1.1" >> /etc/resolv.conf
-    }
-
-    # 判断是否为 Ubuntu/Debian 等使用 systemd-resolved 的系统
-    if systemctl list-unit-files | grep -q "systemd-resolved"; then
-        
-        # 恢复服务 (关键: Unmask + Enable)
-        systemctl unmask systemd-resolved 2>/dev/null
-        systemctl enable --now systemd-resolved 2>/dev/null
-        
-        # [逻辑优化] 尝试恢复软链接
-        # Ubuntu 标准做法是 /etc/resolv.conf -> /run/systemd/resolve/stub-resolv.conf
-        if [ -f /run/systemd/resolve/stub-resolv.conf ]; then
-            rm -f /etc/resolv.conf
-            ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-            log_success "/etc/resolv.conf 已恢复为标准软链接。"
-        else
-            # 存根不存在，回退到保底配置
-            rm -f /etc/resolv.conf
-            gen_reset_resolv_conf
-            log_warn "Systemd-resolved 存根未找到，已重置为公共 DNS。"
-        fi
-        
-        # 尝试重启 resolved 以重新生成配置
-        systemctl restart systemd-resolved 2>/dev/null
-    else
-        # CentOS 7 等老系统，直接重置
-        rm -f /etc/resolv.conf
-        gen_reset_resolv_conf
-        log_success "DNS 已重置为公共 DNS。"
-    fi
-
-    # --- 4. 清理常规优化组件 ---
-    # 移除 ZRAM
-    systemctl disable --now zram >/dev/null 2>&1
-    rm -f /usr/local/bin/zram-start.sh /etc/systemd/system/zram.service
-    
-    # 清理所有 SysPro 相关的内核参数文件
-    rm -f /etc/sysctl.d/97-syspro-latency.conf
-    rm -f /etc/sysctl.d/99-syspro-swap.conf
-    rm -f /etc/sysctl.d/98-syspro-security.conf
-    rm -f /etc/sysctl.d/96-no-audit.conf
-    
-    # 清理 Swap 与 Fstab
-    if [ -f "/swapfile" ]; then swapoff /swapfile 2>/dev/null; rm -f /swapfile; fi
-    if [ -f /etc/fstab.syspro.bak ]; then 
-        cp /etc/fstab.syspro.bak /etc/fstab
-        mount -o remount / 2>/dev/null
-        rm -f /etc/fstab.syspro.bak
-        log_info "已恢复原始 fstab 文件。"
-    fi
-    
-    # 清理 Udev I/O 调度规则
-    rm -f /etc/udev/rules.d/60-io-scheduler.rules
-    if command -v udevadm >/dev/null 2>&1; then udevadm control --reload && udevadm trigger; fi
-    
-    # 清理 Systemd 额外配置 (OOM 保护等)
-    rm -rf /etc/systemd/system/ssh.service.d /etc/systemd/system/sshd.service.d
-    rm -f /etc/security/limits.d/99-disable-core.conf
-    if [ -f /etc/systemd/system.conf.syspro.bak ]; then
-        cp /etc/systemd/system.conf.syspro.bak /etc/systemd/system.conf
-    fi
-
-    # 还原 logind 配置
-    if [ -f /etc/systemd/logind.conf.syspro.bak ]; then
-        mv /etc/systemd/logind.conf.syspro.bak /etc/systemd/logind.conf
-        systemctl restart systemd-logind
-        log_info "已恢复原始 logind.conf 配置。"
-    fi
+    # --- 4. 清理常规优化配置 ---
+    cleanup_optimizations
     
     # --- 5. 刷新系统状态 ---
-    systemctl daemon-reload
+    systemctl daemon-reload 2>/dev/null
     sysctl --system >/dev/null 2>&1
     
-    echo ""
-    echo -e "${GREEN}SysPro 已成功完全卸载。${PLAIN}"
-    echo -e "${YELLOW}提示: Docker 配置已尝试还原，建议重启一次服务器以彻底重置内核状态。${PLAIN}"
+    # --- 6. 显示卸载摘要 ---
+    show_uninstall_summary
 }
 show_menu() {
     clear
