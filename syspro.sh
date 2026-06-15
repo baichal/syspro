@@ -1213,15 +1213,24 @@ EOF
     # 3. 禁用系统级日志服务 (阻止系统日志收集，但保留应用日志路径)
     log_info "正在禁用系统日志服务..."
     local SERVICES=("rsyslog" "systemd-journald" "syslog" "rsyslogd" "kdump" "apport" "abrtd" "avahi-daemon" "auditd")
+    local handled=0
     
     for svc in "${SERVICES[@]}"; do
-        if systemctl is-active --quiet "$svc" || systemctl is-enabled --quiet "$svc"; then
-            systemctl stop "$svc" 2>/dev/null
-            systemctl disable "$svc" 2>/dev/null
-            systemctl mask "$svc" 2>/dev/null
+        # 检查服务单元文件是否存在 (同时检查 systemd 路径与符号链接)
+        if [ -f "/etc/systemd/system/${svc}.service" ] || \
+           [ -f "/lib/systemd/system/${svc}.service" ] || \
+           [ -f "/usr/lib/systemd/system/${svc}.service" ]; then
+            systemctl stop "$svc" >/dev/null 2>&1
+            systemctl disable "$svc" >/dev/null 2>&1
+            systemctl mask "$svc" >/dev/null 2>&1
             log_info "  - 服务已停止并屏蔽: $svc"
+            handled=$((handled + 1))
         fi
     done
+    
+    if [ "$handled" -eq 0 ]; then
+        log_info "  - 未检测到可被禁用的系统日志服务 (已跳过)"
+    fi
 
     # 4. 配置 Journald 不存储日志 (仅作为转发通道)
     log_info "配置 systemd-journald 不存储日志..."
