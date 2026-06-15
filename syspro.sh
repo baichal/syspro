@@ -36,6 +36,27 @@ DOH_URL_LIST="https://freedns.controld.com/p0
 https://8.8.8.8/dns-query"
 
 # ==============================================================================
+#   全局常量定义 (Global Constants)
+#   说明: 使用常量替换魔法数字，提高代码可读性和可维护性
+# ==============================================================================
+
+# 内存相关常量 (MB)
+MIN_MEM_FOR_ZRAM=512          # 启用 ZRAM 的最小内存阈值
+MAX_MEM_FOR_SWAP=4096         # 不需要创建 Swap 的内存阈值
+SWAP_FILE_SIZE=1024           # Swap 文件大小
+MIN_SWAP_REQUIRED=128         # 最小 Swap 要求
+SWAPPINESS_VALUE=10           # swappiness 值
+
+# 时间相关常量 (秒)
+DEFAULT_TIMEOUT_STOP=5        # Systemd 停止超时时间
+DNS_TIMEOUT=5                 # DNS 查询超时时间
+DNS_ATTEMPTS=3                # DNS 查询重试次数
+
+# 权限相关常量
+FILE_PERMISSION=644           # 配置文件权限
+DIR_PERMISSION=755            # 目录权限
+
+# ==============================================================================
 #   全局变量与基础检查
 # ==============================================================================
 
@@ -47,10 +68,23 @@ BLUE='\033[0;34m'
 PLAIN='\033[0m'
 
 # 日志封装函数
-log_info()    { echo -e "${BLUE}[INFO]${PLAIN} $1"; }
-log_success() { echo -e "${GREEN}[OK]${PLAIN} $1"; }
-log_warn()    { echo -e "${YELLOW}[WARN]${PLAIN} $1"; }
-log_err()     { echo -e "${RED}[ERR]${PLAIN} $1"; }
+LOG_FILE="/var/log/syspro-exec.log"
+log_to_file() {
+    mkdir -p /var/log
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$$] $1" >> "$LOG_FILE"
+}
+
+log_info()    { local msg="${BLUE}[INFO]${PLAIN} $1"; echo -e "$msg"; log_to_file "[INFO] $1"; }
+log_success() { local msg="${GREEN}[OK]${PLAIN} $1"; echo -e "$msg"; log_to_file "[OK] $1"; }
+log_warn()    { local msg="${YELLOW}[WARN]${PLAIN} $1"; echo -e "$msg"; log_to_file "[WARN] $1"; }
+log_err()     { local msg="${RED}[ERR]${PLAIN} $1"; echo -e "$msg"; log_to_file "[ERR] $1"; }
+
+# 记录脚本启动信息
+log_to_file "=========================================="
+log_to_file "SysPro v5.3 started"
+log_to_file "Hostname: $(hostname)"
+log_to_file "User: $USER"
+log_to_file "=========================================="
 
 # 1. Root 权限检查
 if [[ $EUID -ne 0 ]]; then
@@ -67,17 +101,40 @@ case $RAW_ARCH in
     *) ARCH="unknown" ;;
 esac
 
-if [ -f /etc/redhat-release ]; then
-    RELEASE="centos"
-elif cat /etc/issue | grep -Eqi "debian"; then
-    RELEASE="debian"
-elif cat /etc/issue | grep -Eqi "ubuntu"; then
-    RELEASE="ubuntu"
-else
-    RELEASE="unknown"
-fi
+# 精确检测系统发行版
+detect_release() {
+    if [ -f /etc/almalinux-release ]; then
+        echo "almalinux"
+    elif [ -f /etc/rocky-release ]; then
+        echo "rocky"
+    elif [ -f /etc/fedora-release ]; then
+        echo "fedora"
+    elif [ -f /etc/centos-release ]; then
+        echo "centos"
+    elif [ -f /etc/redhat-release ]; then
+        echo "centos"
+    elif [ -f /etc/debian_version ]; then
+        echo "debian"
+    elif grep -qi "ubuntu" /etc/os-release 2>/dev/null; then
+        echo "ubuntu"
+    elif grep -qi "debian" /etc/os-release 2>/dev/null; then
+        echo "debian"
+    elif cat /etc/issue | grep -Eqi "debian"; then
+        echo "debian"
+    elif cat /etc/issue | grep -Eqi "ubuntu"; then
+        echo "ubuntu"
+    else
+        echo "unknown"
+    fi
+}
+
+RELEASE=$(detect_release)
 
 log_info "系统环境: ${GREEN}${RELEASE}${PLAIN} | 架构: ${GREEN}${ARCH}${PLAIN} (${RAW_ARCH})"
+
+# 执行配置验证和系统兼容性检查
+validate_dns_config
+validate_system_compatibility
 
 # ==============================================================================
 #   全局辅助函数：包管理器更新
@@ -113,57 +170,177 @@ smart_pkg_update() {
 # 将原本的 "apt-get update" 替换为 "smart_pkg_update" 即可。
 
 # ==============================================================================
+#   配置验证函数
+# ==============================================================================
+
+validate_ipv4() {
+    local ip=$1
+    if echo "$ip" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+        local IFS='.'
+        read -ra octets <<< "$ip"
+        for octet in "${octets[@]}"; do
+            if [ "$octet" -lt 0 ] || [ "$octet" -gt 255 ]; then
+                return 1
+            fi
+        done
+        return 0
+    fi
+    return 1
+}
+
+validate_ipv6() {
+    local ip=$1
+    if echo "$ip" | grep -qE '^([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$' || \
+       echo "$ip" | grep -qE '^([0-9a-fA-F]{1,4}:){1,7}:$' || \
+       echo "$ip" | grep -qE '^([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}$'; then
+        return 0
+    fi
+    return 1
+}
+
+validate_dns_config() {
+    log_info "正在验证 DNS 配置..."
+    local valid=1
+    
+    while read -r ip; do
+        [[ -z "$ip" || "$ip" =~ ^# ]] && continue
+        if ! validate_ipv4 "$ip"; then
+            log_err "无效的 IPv4 地址: $ip"
+            valid=0
+        fi
+    done <<< "$DNS_IPV4_LIST"
+    
+    while read -r ip; do
+        [[ -z "$ip" || "$ip" =~ ^# ]] && continue
+        if ! validate_ipv6 "$ip"; then
+            log_warn "无效的 IPv6 地址: $ip"
+        fi
+    done <<< "$DNS_IPV6_LIST"
+    
+    while read -r url; do
+        [[ -z "$url" || "$url" =~ ^# ]] && continue
+        if ! echo "$url" | grep -qE '^https://'; then
+            log_warn "DoH URL 格式建议使用 https: $url"
+        fi
+    done <<< "$DOH_URL_LIST"
+    
+    if [ "$valid" -eq 1 ]; then
+        log_success "DNS 配置验证通过。"
+        return 0
+    else
+        return 1
+    fi
+}
+
+validate_system_compatibility() {
+    log_info "正在检查系统兼容性..."
+    local compatible=1
+    
+    if [ "$RELEASE" = "unknown" ]; then
+        log_err "无法识别当前系统发行版"
+        compatible=0
+    fi
+    
+    if [ "$ARCH" = "unknown" ]; then
+        log_warn "无法识别当前架构: $RAW_ARCH"
+    fi
+    
+    local os_version=""
+    if [[ "$RELEASE" == "debian" ]]; then
+        os_version=$(cat /etc/debian_version 2>/dev/null | cut -d'.' -f1)
+        if [[ ! "$os_version" =~ ^(10|11|12)$ ]]; then
+            log_warn "检测到 Debian $os_version，推荐版本: 10/11/12"
+        fi
+    elif [[ "$RELEASE" == "ubuntu" ]]; then
+        os_version=$(lsb_release -rs 2>/dev/null)
+        if [[ ! "$os_version" =~ ^(20\.04|22\.04|24\.04)$ ]]; then
+            log_warn "检测到 Ubuntu $os_version，推荐版本: 20.04/22.04/24.04"
+        fi
+    elif [[ "$RELEASE" == "centos" || "$RELEASE" == "almalinux" || "$RELEASE" == "rocky" ]]; then
+        os_version=$(rpm -E %rhel 2>/dev/null)
+        if [[ ! "$os_version" =~ ^(7|8|9)$ ]]; then
+            log_warn "检测到 RHEL/CentOS $os_version，推荐版本: 7/8/9"
+        fi
+    fi
+    
+    if [ "$compatible" -eq 1 ]; then
+        log_success "系统兼容性检查通过。"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# ==============================================================================
 #   模块 1: 磁盘 I/O 调优 (Disk I/O)
 #   修改说明: 移除 CPU 密集型的 bfq 算法，使用 mq-deadline/none
 # ==============================================================================
 optimize_disk_io() {
     log_info "正在优化磁盘 I/O 策略 (低延迟/网络优先模式)..."
+    local errors=0
+    local backups=()
     
     # --- 1.1 挂载参数优化 (noatime) ---
-    # 减少文件访问时间写入，降低小文件 I/O 延迟
-    [ ! -f /etc/fstab.syspro.bak ] && cp /etc/fstab /etc/fstab.syspro.bak
+    if [ ! -f /etc/fstab.syspro.bak ]; then
+        if cp /etc/fstab /etc/fstab.syspro.bak; then
+            backups+=("/etc/fstab.syspro.bak")
+        else
+            log_err "无法备份 fstab 文件"
+            errors=$((errors + 1))
+        fi
+    fi
     
     if grep -q " / " /etc/fstab && grep -E " / .*noatime" /etc/fstab >/dev/null 2>&1; then
         log_info "根分区已配置 noatime，跳过修改。"
     else
         log_info "尝试修改 /etc/fstab 添加 noatime..."
-        awk '$2 == "/" && ($3 == "ext4" || $3 == "xfs" || $3 == "btrfs") { $4 = $4",noatime,nodiratime" } 1' /etc/fstab > /etc/fstab.tmp
-        
-        if cmp -s /etc/fstab /etc/fstab.tmp; then
+        if ! awk '$2 == "/" && ($3 == "ext4" || $3 == "xfs" || $3 == "btrfs") { $4 = $4",noatime,nodiratime" } 1' /etc/fstab > /etc/fstab.tmp; then
+            log_err "fstab 修改失败"
+            errors=$((errors + 1))
+        elif cmp -s /etc/fstab /etc/fstab.tmp; then
             rm -f /etc/fstab.tmp
             log_warn "未检测到标准根分区格式，跳过 fstab 修改。"
         else
-            mv /etc/fstab.tmp /etc/fstab
-            if mount -o remount / 2>/dev/null; then
-                log_success "根分区挂载参数已更新 (noatime)。"
+            if mv /etc/fstab.tmp /etc/fstab; then
+                if mount -o remount / 2>/dev/null; then
+                    log_success "根分区挂载参数已更新 (noatime)。"
+                else
+                    log_err "挂载测试失败！自动回滚 fstab..."
+                    cp /etc/fstab.syspro.bak /etc/fstab
+                    errors=$((errors + 1))
+                fi
             else
-                log_err "挂载测试失败！自动回滚 fstab..."
-                cp /etc/fstab.syspro.bak /etc/fstab
+                log_err "无法替换 fstab 文件"
+                rm -f /etc/fstab.tmp
+                errors=$((errors + 1))
             fi
         fi
     fi
 
     # --- 1.2 I/O 调度器优化 (Udev 规则 - 核心修改) ---
-    # 目标: 降低 I/O 操作对 CPU 的占用，避免 I/O Wait 阻塞网络线程
     if command -v udevadm >/dev/null 2>&1; then
-        cat > /etc/udev/rules.d/60-io-scheduler.rules << EOF
+        if cat > /etc/udev/rules.d/60-io-scheduler.rules << EOF
 # 1. NVMe SSD & 虚拟磁盘 (VPS/KVM)
-# 策略: none / multi-queue
-# 原因: NVMe 速度快，VPS 的 I/O 由宿主机管理，虚拟机内部无需复杂调度
 ACTION=="add|change", KERNEL=="nvme[0-9]*n[0-9]*|vd[a-z]*", ATTR{queue/scheduler}="none"
 
 # 2. 物理 SATA SSD / 机械硬盘 (HDD) / SD卡 (树莓派)
-# 策略: mq-deadline
-# 原因: 相比 bfq，它更轻量，延迟更低
 ACTION=="add|change", KERNEL=="sd[a-z]*|mmcblk[0-9]*", ATTR{queue/scheduler}="mq-deadline"
 
 # 3. 减少预读 (Read-ahead)
-# 随机读写较多时，过大的预读浪费内存；设为 256KB (512扇区) 以平衡性能
 ACTION=="add|change", KERNEL=="vd[a-z]*|sd[a-z]*", ATTR{bdi/read_ahead_kb}="256"
 EOF
-        # 重载规则并触发
-        udevadm control --reload && udevadm trigger
-        log_success "I/O 调度器规则已更新。"
+        then
+            chmod 644 /etc/udev/rules.d/60-io-scheduler.rules
+            if udevadm control --reload && udevadm trigger; then
+                log_success "I/O 调度器规则已更新。"
+            else
+                log_err "Udev 规则重载失败"
+                errors=$((errors + 1))
+            fi
+        else
+            log_err "无法创建 udev 规则文件"
+            errors=$((errors + 1))
+        fi
     else
         log_warn "未找到 udevadm，跳过调度器优化。"
     fi
@@ -173,16 +350,26 @@ EOF
         log_info "检查 Flash 存储 TRIM 自动清理..."
         if [ -d /usr/lib/systemd/system ] || [ -d /etc/systemd/system ]; then
             if systemctl list-unit-files --all | grep -q "fstrim.timer"; then
-                systemctl enable fstrim.timer --now >/dev/null 2>&1
-                log_success "fstrim.timer 已启用。"
+                if systemctl enable fstrim.timer --now >/dev/null 2>&1; then
+                    log_success "fstrim.timer 已启用。"
+                else
+                    log_warn "无法启用 fstrim.timer"
+                fi
             else
                 if [ ! -f /etc/cron.weekly/fstrim ]; then
-                    echo -e "#!/bin/sh\nfstrim -av" > /etc/cron.weekly/fstrim
-                    chmod +x /etc/cron.weekly/fstrim
-                    log_success "已创建 fstrim 周常任务。"
+                    if echo -e "#!/bin/sh\nfstrim -av" > /etc/cron.weekly/fstrim && chmod +x /etc/cron.weekly/fstrim; then
+                        log_success "已创建 fstrim 周常任务。"
+                    else
+                        log_err "无法创建 fstrim 任务"
+                        errors=$((errors + 1))
+                    fi
                 fi
             fi
         fi
+    fi
+    
+    if [ "$errors" -gt 0 ]; then
+        log_warn "I/O 优化完成，但有 $errors 个错误。"
     fi
 }
 
@@ -356,63 +543,50 @@ EOF
 # ==============================================================================
 optimize_memory() {
     log_info "正在优化内存结构 (网络吞吐优先模式 / 修复长期衰减)..."
-
+    local errors=0
+    
     # --- 1. 获取物理内存大小 (MB) ---
     MEM_TOTAL_MB=$(free -m | awk '/Mem:/ {print $2}')
+    if [ -z "$MEM_TOTAL_MB" ] || [ "$MEM_TOTAL_MB" -eq 0 ]; then
+        log_err "无法获取物理内存大小"
+        return 1
+    fi
     HAS_ZRAM=0
     
     # --- 2. ZRAM 策略调整 (关键修复) ---
-    # 原逻辑: <4GB 都开 ZRAM。
-    # 新逻辑: >512MB 坚决不开 ZRAM。
-    # 原因: 网络吞吐需要 CPU 处理软中断。ZRAM 压缩内存也需要 CPU。两者竞争会导致网速随时间下降。
-    
-    if [ "$MEM_TOTAL_MB" -gt 512 ]; then
-        log_info "物理内存充足 (>512MB)，禁用 ZRAM 以消除 CPU 压缩开销，确保网络软中断算力。"
-        
-        # 如果之前开启过，现在关闭并清理
+    if [ "$MEM_TOTAL_MB" -gt "$MIN_MEM_FOR_ZRAM" ]; then
+        log_info "物理内存充足 (>${MIN_MEM_FOR_ZRAM}MB)，禁用 ZRAM..."
         if systemctl is-active zram >/dev/null 2>&1; then
-            systemctl disable --now zram >/dev/null 2>&1
+            if ! systemctl disable --now zram >/dev/null 2>&1; then
+                log_warn "无法禁用 ZRAM 服务"
+            fi
         fi
         rm -f /usr/local/bin/zram-start.sh /etc/systemd/system/zram.service
         HAS_ZRAM=0
     else
-        # 仅针对极低内存机器 (<512MB) 开启救急
-        log_info "检测到微型内存环境 (<512MB)，启用轻量化 ZRAM (lz4模式)..."
-        
-        # 检查内核模块
+        log_info "检测到微型内存环境 (<${MIN_MEM_FOR_ZRAM}MB)，启用轻量化 ZRAM..."
         if modprobe zram num_devices=1; then
-            # 等待设备节点生成
             if command -v udevadm >/dev/null 2>&1; then udevadm settle --timeout=5; else sleep 0.5; fi
             
-            # 如果未启用则配置
             if ! grep -q "zram" /proc/swaps; then
-                # 仅占用 20% 内存，避免挤占 TCP Buffer
                 ZRAM_SIZE=$(($MEM_TOTAL_MB / 5))
-                # 限制 ZRAM 大小范围 [64M, 512M]
-                if [ "$ZRAM_SIZE" -lt 64 ]; then ZRAM_SIZE=64; fi
-                
-                # 强制使用 lz4 算法 (CPU消耗最低，优于 zstd)
+                [ "$ZRAM_SIZE" -lt 64 ] && ZRAM_SIZE=64
                 ALGO="lz4"
                 
-                # 生成启动脚本
-                cat > /usr/local/bin/zram-start.sh <<EOF
+                if cat > /usr/local/bin/zram-start.sh <<EOF
 #!/bin/bash
 modprobe zram num_devices=1
 sleep 0.5
-# 重置设备
 [ -f /sys/block/zram0/reset ] && echo 1 > /sys/block/zram0/reset 2>/dev/null
-# 设置压缩算法
 echo "$ALGO" > /sys/block/zram0/comp_algorithm 2>/dev/null
-# 设置大小
 echo "${ZRAM_SIZE}M" > /sys/block/zram0/disksize
-# 格式化并挂载
 mkswap /dev/zram0 >/dev/null 2>&1
 swapon -p 100 /dev/zram0
 EOF
-                chmod +x /usr/local/bin/zram-start.sh
-                
-                # 生成 Systemd 服务
-                cat > /etc/systemd/system/zram.service <<EOF
+                then
+                    chmod +x /usr/local/bin/zram-start.sh
+                    
+                    if cat > /etc/systemd/system/zram.service <<EOF
 [Unit]
 Description=SysPro Lightweight ZRAM
 After=multi-user.target
@@ -423,67 +597,96 @@ RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
-                systemctl daemon-reload
-                systemctl enable zram --now >/dev/null 2>&1
-                HAS_ZRAM=1
-                log_success "ZRAM 已启用 (大小: ${ZRAM_SIZE}MB, 算法: lz4)。"
+                    then
+                        systemctl daemon-reload
+                        if systemctl enable zram --now >/dev/null 2>&1; then
+                            HAS_ZRAM=1
+                            log_success "ZRAM 已启用 (大小: ${ZRAM_SIZE}MB, 算法: lz4)。"
+                        else
+                            log_err "无法启用 ZRAM 服务"
+                            errors=$((errors + 1))
+                        fi
+                    else
+                        log_err "无法创建 ZRAM 服务文件"
+                        errors=$((errors + 1))
+                    fi
+                else
+                    log_err "无法创建 ZRAM 启动脚本"
+                    errors=$((errors + 1))
+                fi
             fi
         else
             log_warn "内核不支持 ZRAM 模块，跳过。"
         fi
     fi
     
-    # --- 3. Swappiness 优化 (防止 TCP 被换出) ---
-    # 强制设为 10。无论内存多大，网络数据包处理都应在 RAM 中完成，避免磁盘 I/O 延迟。
-    sysctl -w vm.swappiness=10 >/dev/null 2>&1
-    
-    # 持久化配置
-    echo "vm.swappiness = 10" > /etc/sysctl.d/99-syspro-swap.conf
-    log_info "  - Swappiness 已锁定为 10 (物理内存优先，拒绝 Swap 换页延迟)。"
-    
-    # --- 4. 保底磁盘 Swap (防止 OOM 死机) ---
-    # 检查是否已有 Swap
-    CURRENT_SWAP_MB=$(free -m | awk '/Swap:/ {print $2}')
-    
-    # 如果已有 Swap 或者物理内存大于 4GB，则不需要创建文件 Swap
-    if [ "$CURRENT_SWAP_MB" -ge 128 ] || [ "$MEM_TOTAL_MB" -gt 4096 ]; then
-        return
+    # --- 3. Swappiness 优化 ---
+    if sysctl -w vm.swappiness="$SWAPPINESS_VALUE" >/dev/null 2>&1; then
+        if echo "vm.swappiness = $SWAPPINESS_VALUE" > /etc/sysctl.d/99-syspro-swap.conf; then
+            chmod $FILE_PERMISSION /etc/sysctl.d/99-syspro-swap.conf
+            log_info "  - Swappiness 已锁定为 $SWAPPINESS_VALUE。"
+        else
+            log_err "无法保存 swappiness 配置"
+            errors=$((errors + 1))
+        fi
+    else
+        log_err "无法设置 swappiness"
+        errors=$((errors + 1))
     fi
     
-    log_warn "系统无 Swap 且内存较小，正在创建保底 Swap (/swapfile 1GB)..."
-    SIZE=1024
+    # --- 4. 保底磁盘 Swap ---
+    CURRENT_SWAP_MB=$(free -m | awk '/Swap:/ {print $2}')
+    if [ "$CURRENT_SWAP_MB" -ge "$MIN_SWAP_REQUIRED" ] || [ "$MEM_TOTAL_MB" -gt "$MAX_MEM_FOR_SWAP" ]; then
+        log_info "Swap 已存在或内存充足，跳过 Swap 创建。"
+        return 0
+    fi
     
-    # 检查磁盘空间
+    log_warn "系统无 Swap 且内存较小，正在创建保底 Swap..."
+    SIZE=$SWAP_FILE_SIZE
+    
     DISK_AVAIL=$(df -m / | awk 'NR==2 {print $4}')
     if [ "$DISK_AVAIL" -lt 2048 ]; then
         log_err "磁盘空间不足，跳过 Swap 创建。"
-        return
+        return 0
     fi
 
-    # 创建流程
     rm -f /swapfile && touch /swapfile
     
-    # 处理 Btrfs 文件系统
     FS_TYPE=$(df -T /swapfile | tail -1 | awk '{print $2}')
     if [ "$FS_TYPE" == "btrfs" ] && command -v chattr >/dev/null; then 
         chattr +C /swapfile
     fi
     
-    # 分配空间
     if ! fallocate -l ${SIZE}M /swapfile 2>/dev/null; then
-        dd if=/dev/zero of=/swapfile bs=1M count=$SIZE status=none
+        log_info "fallocate 不可用，使用 dd 创建 Swap..."
+        if ! dd if=/dev/zero of=/swapfile bs=1M count=$SIZE status=none; then
+            log_err "无法创建 Swap 文件"
+            errors=$((errors + 1))
+            return 0
+        fi
     fi
     
     chmod 600 /swapfile
-    mkswap /swapfile >/dev/null 2>&1
-    swapon /swapfile
-    
-    # 写入 fstab
-    if ! grep -q "/swapfile" /etc/fstab; then 
-        echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
+    if mkswap /swapfile >/dev/null 2>&1; then
+        if swapon /swapfile; then
+            if ! grep -q "/swapfile" /etc/fstab; then 
+                echo "/swapfile swap swap defaults 0 0" >> /etc/fstab
+            fi
+            log_success "保底磁盘 Swap (1GB) 已创建。"
+        else
+            log_err "无法启用 Swap"
+            rm -f /swapfile
+            errors=$((errors + 1))
+        fi
+    else
+        log_err "无法格式化 Swap"
+        rm -f /swapfile
+        errors=$((errors + 1))
     fi
     
-    log_success "保底磁盘 Swap (1GB) 已创建。"
+    if [ "$errors" -gt 0 ]; then
+        log_warn "内存优化完成，但有 $errors 个错误。"
+    fi
 }
 
 # ==============================================================================
@@ -492,7 +695,7 @@ EOF
 optimize_security() {
     log_info "应用内核级安全加固..."
     
-    cat > /etc/sysctl.d/98-syspro-security.conf << EOF
+    if cat > /etc/sysctl.d/98-syspro-security.conf << EOF
 # 限制暴露内核指针地址 (防止内核漏洞利用)
 kernel.kptr_restrict = 2
 # 限制普通用户读取 dmesg 日志
@@ -502,8 +705,16 @@ kernel.sysrq = 16
 # 禁止响应 ICMP ping
 net.ipv4.icmp_echo_ignore_all = 1
 EOF
-    sysctl -p /etc/sysctl.d/98-syspro-security.conf >/dev/null 2>&1
-    log_success "内核安全参数已加载。"
+    then
+        chmod 644 /etc/sysctl.d/98-syspro-security.conf
+        if sysctl -p /etc/sysctl.d/98-syspro-security.conf >/dev/null 2>&1; then
+            log_success "内核安全参数已加载。"
+        else
+            log_err "无法加载内核安全参数"
+        fi
+    else
+        log_err "无法创建安全配置文件"
+    fi
 }
 
 # ==============================================================================
@@ -566,8 +777,8 @@ install_cloudflared() {
         UPSTREAM_ARGS="$UPSTREAM_ARGS --upstream $url"
     done <<< "$DOH_URL_LIST"
 
-    # --- 4. 生成 Systemd 服务 (保持不变) ---
-    cat > /etc/systemd/system/syspro-doh.service << EOF
+    # --- 4. 生成 Systemd 服务 ---
+    if cat > /etc/systemd/system/syspro-doh.service << EOF
 [Unit]
 Description=SysPro DoH Client (Cloudflared)
 After=network.target network-online.target docker.service
@@ -586,6 +797,12 @@ StandardOutput=null
 [Install]
 WantedBy=multi-user.target
 EOF
+    then
+        chmod 644 /etc/systemd/system/syspro-doh.service
+    else
+        log_err "无法创建 DoH 服务文件"
+        return 1
+    fi
 
     # --- 5. 处理端口冲突 (保持不变) ---
     if systemctl is-active systemd-resolved >/dev/null 2>&1 || systemctl is-enabled systemd-resolved >/dev/null 2>&1; then
@@ -647,10 +864,9 @@ EOF
     fi
 }
 
-optimize_access() {
-    log_info "正在优化接入层 (SSH & Environment)..."
-
-    # --- 5.1 SSH 优化 (保持不变) ---
+optimize_ssh() {
+    log_info "正在优化 SSH 配置..."
+    
     SSHD_CONF="/etc/ssh/sshd_config"
     [ ! -f ${SSHD_CONF}.syspro.bak ] && cp $SSHD_CONF ${SSHD_CONF}.syspro.bak
     
@@ -660,24 +876,52 @@ optimize_access() {
     "$SSHD_CONF"
     
     if sshd -t; then
-        if [[ "${RELEASE}" == "centos" ]]; then systemctl restart sshd; else systemctl restart ssh; fi
+        if [[ "${RELEASE}" == "centos" ]]; then 
+            systemctl restart sshd
+        else 
+            systemctl restart ssh
+        fi
         log_success "SSH 配置优化完成 (已禁用 DNS反查)。"
     else
         log_err "SSH 配置校验失败，已自动回滚。"
         cp ${SSHD_CONF}.syspro.bak $SSHD_CONF
     fi
+}
 
-    # --- 5.2 Shell 优化 (原样保留，此处省略以节省篇幅，请保留原脚本5.2内容) ---
-    # (您原脚本的 734-747 行内容保持不变)
-    # 如果您直接复制粘贴，请确保 Shell 优化部分的 cat > /etc/profile.d ... 仍然存在
+optimize_shell_env() {
+    log_info "正在优化 Shell 环境..."
+    
+    cat > /etc/profile.d/syspro.sh << 'EOF'
+# SysPro Shell Enhancements
+export HISTTIMEFORMAT="%F %T "
+export HISTSIZE=100000
+export HISTFILESIZE=100000
+export HISTCONTROL=ignoredups:ignorespace
 
-    # --- 5.3 DNS 配置 (针对不稳定的核心修复) ---
+# Color prompt for root
+if [ "$USER" = "root" ]; then
+    PS1='\[\033[01;31m\]\u@\h\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ '
+fi
+EOF
+    chmod $FILE_PERMISSION /etc/profile.d/syspro.sh
+    log_success "Shell 环境优化完成。"
+}
+
+configure_dns() {
+    log_info "正在配置 DNS..."
+    
     echo -e "${YELLOW}请选择 DNS 模式:${PLAIN}"
     echo -e " 1. ${GREEN}标准 UDP DNS${PLAIN} (使用脚本开头配置的 IP, 兼容性最佳)"
     echo -e " 2. ${GREEN}DoH 加密 DNS${PLAIN} (防劫持, Docker 自动配置备用 IP)"
-    read -p "请输入选项 [1-2] (默认1): " DNS_CHOICE
     
-    # 1. 解锁并清理
+    while true; do
+        read -p "请输入选项 [1-2] (默认1): " DNS_CHOICE
+        if [[ "$DNS_CHOICE" =~ ^[1-2]$ || -z "$DNS_CHOICE" ]]; then
+            break
+        fi
+        log_err "无效输入，请输入 1 或 2"
+    done
+    
     chattr -i /etc/resolv.conf >/dev/null 2>&1
     
     if [ -f /etc/systemd/system/syspro-doh.service ]; then
@@ -685,21 +929,14 @@ optimize_access() {
         systemctl disable syspro-doh
     fi
 
-    # 2. 辅助变量：用户配置的 DNS JSON 串
     USER_DNS_JSON=$(get_docker_dns_string)
 
-    # 3. 分支处理
     if [[ "$DNS_CHOICE" == "2" ]]; then
-        # === DoH 模式 ===
-        # install_cloudflared 函数内部会处理 Docker 配置 (DoH IP + User Config IP)
         if install_cloudflared; then
             rm -f /etc/resolv.conf
             echo "# SysPro DoH (Cloudflared)" > /etc/resolv.conf
             echo "nameserver 127.0.0.1" >> /etc/resolv.conf
-            
-            # [修复] 提高超时时间到 5 秒，避免网络波动导致解析失败
-            echo "options timeout:5 attempts:3" >> /etc/resolv.conf
-            
+            echo "options timeout:$DNS_TIMEOUT attempts:$DNS_ATTEMPTS" >> /etc/resolv.conf
             chattr +i /etc/resolv.conf
             log_success "DoH 模式已生效 (宿主机: 127.0.0.1, Docker: 混合模式)。"
         else
@@ -709,17 +946,14 @@ optimize_access() {
     fi
 
     if [[ "$DNS_CHOICE" != "2" ]]; then
-        # === 标准 UDP 模式 (修复容器不稳定) ===
         rm -f /etc/resolv.conf
         echo "# SysPro Standard DNS" > /etc/resolv.conf
         
-        # 写入 IPv4 配置列表
         while read -r ip; do
             [[ -z "$ip" || "$ip" =~ ^# ]] && continue
             echo "nameserver $ip" >> /etc/resolv.conf
         done <<< "$DNS_IPV4_LIST"
         
-        # 写入 IPv6 (如果存在)
         if ip -6 addr show scope global | grep -q inet6; then
             while read -r ip; do
                 [[ -z "$ip" || "$ip" =~ ^# ]] && continue
@@ -727,23 +961,13 @@ optimize_access() {
             done <<< "$DNS_IPV6_LIST"
         fi
         
-        # [修复] 
-        # 1. 移除 timeout:2 (过短)，改为 5s。
-        # 2. 增加 attempts:3 (增加重试机会)。
-        # 3. 增加 rotate (负载均衡，利用所有配置的 IP)。
-        echo "options timeout:5 attempts:3 rotate" >> /etc/resolv.conf
+        echo "options timeout:$DNS_TIMEOUT attempts:$DNS_ATTEMPTS rotate" >> /etc/resolv.conf
         chattr +i /etc/resolv.conf
         
-        # [关键修复] 显式配置 Docker daemon.json
-        # 即使宿主机已配置 resolv.conf，强制写入 daemon.json 可以防止 Docker 
-        # 在容器启动瞬间读取到错误配置或回退到 Google DNS。
         if command -v docker >/dev/null 2>&1; then
             mkdir -p /etc/docker
             [ -f /etc/docker/daemon.json ] && cp /etc/docker/daemon.json /etc/docker/daemon.json.syspro.bak
-            
-            # 使用用户配置的 IP 列表
             echo "{ \"dns\": [$USER_DNS_JSON] }" > /etc/docker/daemon.json
-            
             log_info "正在重启 Docker 以应用稳定的 DNS 配置..."
             systemctl restart docker
             log_success "Docker DNS 已强制同步为用户配置列表 (无 DoH 代理)。"
@@ -751,6 +975,14 @@ optimize_access() {
         
         log_success "标准 DNS 模式已生效。"
     fi
+}
+
+optimize_access() {
+    log_info "正在优化接入层 (SSH & Environment)..."
+    
+    optimize_ssh
+    optimize_shell_env
+    configure_dns
 }
 
 # ==============================================================================
@@ -797,7 +1029,14 @@ maintenance_tasks() {
     echo -e " 6. ${GREEN}Europe/London${PLAIN}         (伦敦时间 UTC+0/1)"
     echo -e " 0. ${YELLOW}保持不变${PLAIN}"
     
-    read -p "请输入选项 [0-6] (默认1): " TZ_CHOICE
+    # 输入验证
+    while true; do
+        read -p "请输入选项 [0-6] (默认1): " TZ_CHOICE
+        if [[ "$TZ_CHOICE" =~ ^[0-6]$ || -z "$TZ_CHOICE" ]]; then
+            break
+        fi
+        log_err "无效输入，请输入 0-6 之间的数字"
+    done
     
     case "${TZ_CHOICE:-1}" in
         1) SET_TZ="Asia/Shanghai" ;;
@@ -995,9 +1234,22 @@ manual_tasks_menu() {
 # ==============================================================================
 optimize_logging_killer() {
     echo -e "${RED}================================================================${PLAIN}"
-    echo -e "${RED} [警告] 正在执行：禁用系统日志生成...       ${PLAIN}"
-    echo -e "${RED} 此操作将禁用系统日志服务，但保留应用日志正常书写。   ${PLAIN}"
+    echo -e "${RED} [警告] 禁用系统日志生成                   ${PLAIN}"
+    echo -e "${RED}----------------------------------------------------------------${PLAIN}"
+    echo -e "${RED} 此操作将：                          ${PLAIN}"
+    echo -e "${RED}   - 停止并禁用系统日志服务            ${PLAIN}"
+    echo -e "${RED}   - 清理系统日志文件                  ${PLAIN}"
+    echo -e "${RED}   - 降低内核日志级别                  ${PLAIN}"
+    echo -e "${YELLOW} 注意: 应用日志（如 nginx, docker）仍可正常书写。${PLAIN}"
+    echo -e "${RED}----------------------------------------------------------------${PLAIN}"
+    echo -e "${RED} 风险警告: 禁用系统日志可能影响问题排查！${PLAIN}"
     echo -e "${RED}================================================================${PLAIN}"
+    
+    read -p "确认继续执行吗? [y/N]: " CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[yY]$ ]]; then
+        log_info "操作已取消。"
+        return 0
+    fi
     
     # 1. 创建状态标记文件
     touch /etc/syspro_logs_killed
@@ -1095,7 +1347,23 @@ EOF
 #   功能: 恢复日志、还原 Docker 网络、清理旧版防火墙规则、重置 DNS
 # ==============================================================================
 uninstall_syspro() {
-    echo -e "${RED}警告: 正在卸载 SysPro 及所有扩展组件...${PLAIN}"
+    echo -e "${RED}================================================================${PLAIN}"
+    echo -e "${RED} [警告] 卸载 SysPro 及所有扩展组件         ${PLAIN}"
+    echo -e "${RED}----------------------------------------------------------------${PLAIN}"
+    echo -e "${RED} 此操作将：                          ${PLAIN}"
+    echo -e "${RED}   - 恢复系统日志服务                  ${PLAIN}"
+    echo -e "${RED}   - 移除 DoH 客户端                  ${PLAIN}"
+    echo -e "${RED}   - 删除 Swap 文件                   ${PLAIN}"
+    echo -e "${RED}   - 还原系统配置文件                  ${PLAIN}"
+    echo -e "${RED}----------------------------------------------------------------${PLAIN}"
+    echo -e "${YELLOW} 注意: 此操作不可逆，请确保已备份重要数据！${PLAIN}"
+    echo -e "${RED}================================================================${PLAIN}"
+    
+    read -p "确认继续卸载吗? [y/N]: " CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[yY]$ ]]; then
+        log_info "操作已取消。"
+        return 0
+    fi
     
     # --- 1. 恢复日志系统 (如果曾被禁用) ---
     if [ -f "/etc/syspro_logs_killed" ]; then
