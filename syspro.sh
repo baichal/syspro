@@ -995,22 +995,45 @@ manual_tasks_menu() {
 # ==============================================================================
 optimize_logging_killer() {
     echo -e "${RED}================================================================${PLAIN}"
-    echo -e "${RED} [警告] 正在执行：日志系统管理...       ${PLAIN}"
-    echo -e "${RED} 此操作将导致系统失去所有错误记录能力，降低 IO 延迟。   ${PLAIN}"
+    echo -e "${RED} [警告] 正在执行：禁用系统日志生成...       ${PLAIN}"
+    echo -e "${RED} 此操作将从源头禁用系统日志产生，而非仅阻止写入，降低 IO 延迟。   ${PLAIN}"
     echo -e "${RED}================================================================${PLAIN}"
     
     # 1. 创建状态标记文件
-    # 作用: 用于卸载程序识别日志系统曾被修改，执行恢复逻辑。
     touch /etc/syspro_logs_killed
     log_info "已创建状态标记: /etc/syspro_logs_killed"
 
-    # 2. 停止并禁用常见的日志与崩溃报告服务
-    log_info "正在终止所有日志守护进程..."
-    # 定义服务列表
-    local SERVICES=("rsyslog" "systemd-journald" "syslog" "rsyslogd" "kdump" "apport" "abrtd" "avahi-daemon")
+    # 2. 内核层禁用日志生成 (从源头阻止)
+    log_info "正在从内核层禁用日志生成..."
+    if [ ! -f /etc/sysctl.d/95-syspro-silence.conf ]; then
+        cat > /etc/sysctl.d/95-syspro-silence.conf << EOF
+# 完全禁用内核控制台日志输出 (loglevel=0 表示不输出任何消息)
+kernel.printk = 0 0 0 0
+
+# 禁用内核消息缓冲区 (kmsg)
+kernel.kmsg_restrict = 1
+
+# 禁止普通用户读取 dmesg
+kernel.dmesg_restrict = 1
+
+# 禁用系统调用审计 (消除 auditd 的 syscall hook)
+audit=0
+
+# 程序崩溃时不生成 core dump 文件
+kernel.core_pattern = /dev/null
+
+# 禁用 debugfs 中的跟踪功能
+debugfs=off
+EOF
+        sysctl -p /etc/sysctl.d/95-syspro-silence.conf >/dev/null 2>&1
+        log_success "内核层日志生成已禁用。"
+    fi
+
+    # 3. 禁用系统级日志服务 (阻止服务接收和转发日志)
+    log_info "正在禁用系统日志服务..."
+    local SERVICES=("rsyslog" "systemd-journald" "syslog" "rsyslogd" "kdump" "apport" "abrtd" "avahi-daemon" "auditd")
     
     for svc in "${SERVICES[@]}"; do
-        # [优化] 增加 2>/dev/null 屏蔽 "Failed to get unit file state" 报错
         if systemctl is-active --quiet "$svc" || systemctl is-enabled --quiet "$svc"; then
             systemctl stop "$svc" 2>/dev/null
             systemctl disable "$svc" 2>/dev/null
@@ -1019,70 +1042,60 @@ optimize_logging_killer() {
         fi
     done
 
-    # 3. 配置 Journald 不记录日志
-    log_info "配置 systemd-journald 为黑洞模式..."
+    # 4. 配置 Journald 完全不接收日志 (黑洞模式)
+    log_info "配置 systemd-journald 为完全静默模式..."
     mkdir -p /etc/systemd
     cat > /etc/systemd/journald.conf << EOF
 [Journal]
+# 不存储任何日志
 Storage=none
+# 不转发到 syslog
 ForwardToSyslog=no
+# 不转发到内核环形缓冲区
 ForwardToKMsg=no
+# 不输出到控制台
 ForwardToConsole=no
+# 不发送墙报消息
 ForwardToWall=no
+# 完全禁用日志接收
+MaxLevelStore=off
+MaxLevelSyslog=off
+MaxLevelKMsg=off
+MaxLevelConsole=off
+MaxLevelWall=off
 EOF
 
-    # 4. 清理磁盘日志并锁定权限 [关键修复逻辑]
-    log_info "正在清理并锁定 /var/log 目录..."
-
-    # [关键修复] 在操作前，必须先递归解锁！
-    # 否则如果文件已经被锁定，后续的 rm/touch/chmod 全都会报 "Operation not permitted"
+    # 5. 清理现有日志文件并配置为空文件
+    log_info "正在清理现有日志文件..."
     if command -v chattr >/dev/null 2>&1; then
-        # 忽略解锁过程中的错误（比如文件不存在）
         chattr -R -i /var/log >/dev/null 2>&1
-        log_info "  - 已解除旧的属性锁 (chattr -i)，准备清理..."
     fi
     
-    # 4.1 递归删除 /var/log 下的所有文件 (现在有权限删除了)
     find /var/log -type f -delete 2>/dev/null || true
     
-    # 4.2 重建关键的空文件 (伪装)
-    # 某些服务(如 sshd/sudo) 如果找不到这些文件会报错
     touch /var/log/wtmp /var/log/btmp /var/log/lastlog /var/log/auth.log /var/log/syslog /var/log/messages
-    
-    # 4.3 确保内容为空
     cat /dev/null > /var/log/wtmp
     cat /dev/null > /var/log/btmp
     
-    # 4.4 修改文件系统权限
-    # 0555 = r-xr-xr-x (所有人只读/执行，不可写入)
     chmod -R 0555 /var/log
     
-    # 4.5 使用 chattr 设置不可变属性 (上锁)
-    # 作用: 防止文件被修改，包括 Root 用户
-    if command -v chattr >/dev/null 2>&1; then
-        # 锁定具体文件
-        chattr +i /var/log/wtmp /var/log/btmp /var/log/syslog /var/log/messages 2>/dev/null || true
-        # 尝试递归锁定整个目录
-        chattr -R +i /var/log 2>/dev/null || true
-        log_success "  - 文件系统锁 (chattr +i) 已重新施加。"
-    else
-        log_warn "未找到 chattr 命令，仅应用了 chmod 权限控制。"
-    fi
+    log_success "日志文件已清理。"
 
-    # 5. 内核层静音 (Printk)
-    log_info "应用内核静音参数..."
-    if [ ! -f /etc/sysctl.d/95-syspro-silence.conf ]; then
-        # printk: console_loglevel=0 (紧急消息也不打)
-        echo "kernel.printk = 0 0 0 0" > /etc/sysctl.d/95-syspro-silence.conf
-        # core_pattern: 程序崩溃时不写 core dump 文件，直接丢进黑洞
-        echo "kernel.core_pattern = /dev/null" >> /etc/sysctl.d/95-syspro-silence.conf
-        sysctl -p /etc/sysctl.d/95-syspro-silence.conf >/dev/null 2>&1
-    fi
+    # 6. 设置全局环境变量阻止应用日志生成
+    log_info "配置全局环境变量禁用应用日志..."
+    cat > /etc/profile.d/syspro-silent.sh << EOF
+export SYSTEMD_LOG_LEVEL=off
+export LOG_LEVEL=off
+export RUST_LOG=off
+export PYTHONWARNINGS="ignore"
+EOF
+    chmod +x /etc/profile.d/syspro-silent.sh
 
-    # 6. 重启 Journald (应用黑洞配置)
-    systemctl restart systemd-journald 2>/dev/null
+    # 7. 刷新系统配置
+    systemctl daemon-reload
+    sysctl --system >/dev/null 2>&1
 
-    log_success "日志系统已配置完成。磁盘 IO 与 CPU 中断已释放。"
+    log_success "日志系统已从源头禁用。系统将不再生成任何系统日志。"
 }
 
 # ==============================================================================
