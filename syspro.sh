@@ -878,7 +878,7 @@ test_dns_server() {
 #   而很多程序（如 Go 编写的 acme 客户端）只要系统声明自己具备 IPv6 能力，就会
 #   在 A/AAAA 都存在时优先选用 AAAA，与 resolv.conf 配置无关。
 #   做法: 每次运行都以 DNS_IPV6_LIST 的实测结果为准 ——
-#     测出不可用 -> 临时禁用内核 IPv6（写入 sysctl.d 持久化）
+#     测出不可用 -> 禁用内核 IPv6（写入 sysctl.d 持久化，重启后依然生效）
 #     测出已可用 -> 若此前是被本脚本禁用的，自动撤销、恢复启用
 #   不会在本来就没有 IPv6 地址/路由的机器上做任何改动。
 # ------------------------------------------------------------------------------
@@ -895,7 +895,7 @@ net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 EOF
             chmod $FILE_PERMISSION "$marker"
-            log_warn "本次测得 IPv6 不可达，已临时禁用内核 IPv6"
+            log_warn "本次测得 IPv6 不可达，已禁用内核 IPv6"
         fi
     else
         if [ -f "$marker" ]; then
