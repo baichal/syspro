@@ -1450,8 +1450,26 @@ restore_dns() {
     
     gen_default_resolv_conf() {
         echo "# SysPro Reset - 恢复为默认 DNS" > /etc/resolv.conf
-        echo "nameserver 8.8.8.8" >> /etc/resolv.conf
-        echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+        local candidates="8.8.8.8
+1.1.1.1
+9.9.9.9"
+        local added=0
+        while read -r ip; do
+            [[ -z "$ip" ]] && continue
+            if test_dns_server "$ip" 2; then
+                echo "nameserver $ip" >> /etc/resolv.conf
+                added=$((added + 1))
+                log_success "  - $ip 可用，已加入"
+            else
+                log_warn "  - $ip 不可达，已跳过"
+            fi
+        done <<< "$candidates"
+
+        if [ "$added" -eq 0 ]; then
+            log_warn "未发现可用的 DNS，写入默认列表"
+            echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+            echo "nameserver 1.1.1.1" >> /etc/resolv.conf
+        fi
     }
 
     if systemctl list-unit-files | grep -q "systemd-resolved"; then
