@@ -854,15 +854,9 @@ EOF
 }
 
 # ------------------------------------------------------------------------------
-#   DNS 服务器真实可用性测试
-#   背景: 仅凭“网卡是否分配到 IPv6 地址”(ip -6 addr) 无法判断该地址是否真的能
-#         访问外网 —— 常见于网关 NDP/路由未生效的 VPS，地址看似存在但实际是一条
-#         死路，写入 resolv.conf 后会被 rotate 选项轮询到，每次卡满
-#         timeout*attempts (默认5x3=15秒) 才会超时切换，多次累加极易导致
-#         acme.sh/lego 等工具的 DNS 校验（如 1Panel 申请证书时的
-#         "waiting for record propagation"）长时间卡住。
-#   做法: 对列表中的每个 DNS IP 做一次真实探测（优先用 dig 发真实查询，没有 dig
-#         则退化为 TCP 53 端口握手），不通的直接跳过、不写入 resolv.conf。
+#   DNS 服务器连通性测试
+#   对给定的 DNS 服务器 IP 发起一次真实探测：优先用 dig 发 DNS 查询，
+#   没有 dig 则用 TCP 53 端口握手代替；超时由 timeout 参数控制。
 # ------------------------------------------------------------------------------
 test_dns_server() {
     local ip="$1"
@@ -908,7 +902,7 @@ configure_dns() {
             echo "options timeout:$DNS_TIMEOUT attempts:$DNS_ATTEMPTS" >> /etc/resolv.conf
             chattr +i /etc/resolv.conf
             log_success "DoH 模式已生效。Docker 容器将自动使用宿主机 DNS。"
-            log_warn "/etc/resolv.conf 已设置为不可变 (chattr +i)。如后续需要手动编辑，请先执行: chattr -i /etc/resolv.conf"
+            log_info "/etc/resolv.conf 已设置为不可变 (chattr +i)，如需编辑请先执行 chattr -i /etc/resolv.conf"
         else
             log_warn "DoH 安装失败，自动回退到标准 UDP 模式。"
             DNS_CHOICE="1"
@@ -919,7 +913,7 @@ configure_dns() {
         rm -f /etc/resolv.conf
         echo "# SysPro Standard DNS" > /etc/resolv.conf
 
-        log_info "正在逐一测试 IPv4 DNS 服务器真实连通性..."
+        log_info "正在测试 IPv4 DNS 服务器连通性..."
         local v4_added=0
         while read -r ip; do
             [[ -z "$ip" || "$ip" =~ ^# ]] && continue
@@ -928,14 +922,13 @@ configure_dns() {
                 v4_added=$((v4_added + 1))
                 log_success "  - $ip 可用，已加入"
             else
-                log_warn "  - $ip 无响应/不可达，已跳过"
+                log_warn "  - $ip 不可达，已跳过"
             fi
         done <<< "$DNS_IPV4_LIST"
 
-        # 兜底：万一所有自定义IPv4都测试失败（比如这台机器此刻整体断网），
-        # 不要写出一个空的 resolv.conf，按原列表写入，避免彻底无法解析
+        # 兜底：避免 resolv.conf 被写空
         if [ "$v4_added" -eq 0 ]; then
-            log_warn "所有自定义 IPv4 DNS 测试均未通过（可能当前网络异常），仍按原列表写入，不做可用性保证"
+            log_warn "未发现可用的 IPv4 DNS，按原列表写入"
             while read -r ip; do
                 [[ -z "$ip" || "$ip" =~ ^# ]] && continue
                 echo "nameserver $ip" >> /etc/resolv.conf
@@ -947,7 +940,7 @@ configure_dns() {
         # 出网（常见于网关 NDP/路由异常的 VPS：地址看着有，实际是条死路）。
         # 真正可靠的判断交给下面对 DNS_IPV6_LIST 每一项的连通性测试。
         if ip -6 route show default >/dev/null 2>&1 && ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
-            log_info "检测到本机存在 IPv6 地址与默认路由，正在逐一测试 IPv6 DNS 服务器真实连通性..."
+            log_info "正在测试 IPv6 DNS 服务器连通性..."
             local v6_added=0
             while read -r ip; do
                 [[ -z "$ip" || "$ip" =~ ^# ]] && continue
@@ -956,19 +949,19 @@ configure_dns() {
                     v6_added=$((v6_added + 1))
                     log_success "  - $ip (IPv6) 可用，已加入"
                 else
-                    log_warn "  - $ip (IPv6) 连接超时/不可达，已跳过（这正是导致 DNS 校验/证书申请卡住的常见原因）"
+                    log_warn "  - $ip (IPv6) 不可达，已跳过"
                 fi
             done <<< "$DNS_IPV6_LIST"
             if [ "$v6_added" -eq 0 ]; then
-                log_warn "本机虽分配了 IPv6 地址，但实际出口不可用（多半是网关 NDP 未建立），已自动全部跳过，仅使用 IPv4 DNS"
+                log_warn "未发现可用的 IPv6 DNS，仅写入 IPv4"
             fi
         else
-            log_info "未检测到可用的 IPv6 默认路由，跳过 IPv6 DNS 配置"
+            log_info "未检测到 IPv6 默认路由，跳过 IPv6 DNS 配置"
         fi
 
         echo "options timeout:$DNS_TIMEOUT attempts:$DNS_ATTEMPTS rotate" >> /etc/resolv.conf
         chattr +i /etc/resolv.conf
-        log_warn "/etc/resolv.conf 已设置为不可变 (chattr +i) 以防被系统自动覆盖。如后续需要手动编辑，请先执行: chattr -i /etc/resolv.conf"
+        log_info "/etc/resolv.conf 已设置为不可变 (chattr +i)，如需编辑请先执行 chattr -i /etc/resolv.conf"
 
         log_success "标准 DNS 模式已生效。"
     fi
