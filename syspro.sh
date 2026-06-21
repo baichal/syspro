@@ -872,6 +872,41 @@ test_dns_server() {
     fi
 }
 
+# ------------------------------------------------------------------------------
+#   内核 IPv6 状态同步（按本次实测结果双向调整，而非一次性开关）
+#   背景: 网卡分配了 IPv6 地址不代表真的能出网（常见于网关 NDP 未建立的 VPS）；
+#   而很多程序（如 Go 编写的 acme 客户端）只要系统声明自己具备 IPv6 能力，就会
+#   在 A/AAAA 都存在时优先选用 AAAA，与 resolv.conf 配置无关。
+#   做法: 每次运行都以 DNS_IPV6_LIST 的实测结果为准 ——
+#     测出不可用 -> 临时禁用内核 IPv6（写入 sysctl.d 持久化）
+#     测出已可用 -> 若此前是被本脚本禁用的，自动撤销、恢复启用
+#   不会在本来就没有 IPv6 地址/路由的机器上做任何改动。
+# ------------------------------------------------------------------------------
+sync_ipv6_kernel_state() {
+    local usable="$1"   # 1 = 本次测试可用    0 = 本次测试不可用
+    local marker="/etc/sysctl.d/99-syspro-disable-ipv6.conf"
+
+    if [ "$usable" -eq 0 ]; then
+        if [ ! -f "$marker" ]; then
+            sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1
+            sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1
+            cat > "$marker" << 'EOF'
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+EOF
+            chmod $FILE_PERMISSION "$marker"
+            log_warn "本次测得 IPv6 不可达，已临时禁用内核 IPv6"
+        fi
+    else
+        if [ -f "$marker" ]; then
+            rm -f "$marker"
+            sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
+            sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
+            log_info "本次测得 IPv6 已恢复可用，已重新启用内核 IPv6"
+        fi
+    fi
+}
+
 configure_dns() {
     log_info "正在配置 DNS..."
     
@@ -954,6 +989,9 @@ configure_dns() {
             done <<< "$DNS_IPV6_LIST"
             if [ "$v6_added" -eq 0 ]; then
                 log_warn "未发现可用的 IPv6 DNS，仅写入 IPv4"
+                sync_ipv6_kernel_state 0
+            else
+                sync_ipv6_kernel_state 1
             fi
         else
             log_info "未检测到 IPv6 默认路由，跳过 IPv6 DNS 配置"
@@ -1513,16 +1551,24 @@ cleanup_optimizations() {
         "/etc/sysctl.d/99-syspro-swap.conf"
         "/etc/sysctl.d/98-syspro-security.conf"
         "/etc/sysctl.d/96-no-audit.conf"
+        "/etc/sysctl.d/99-syspro-disable-ipv6.conf"
     )
     local sysctl_removed=0
+    local ipv6_was_disabled=0
     for f in "${sysctl_files[@]}"; do
         if [ -f "$f" ]; then
+            [ "$f" = "/etc/sysctl.d/99-syspro-disable-ipv6.conf" ] && ipv6_was_disabled=1
             rm -f "$f"
             sysctl_removed=$((sysctl_removed + 1))
         fi
     done
     if [ "$sysctl_removed" -gt 0 ]; then
         log_info "  - 已移除 $sysctl_removed 个内核参数文件"
+    fi
+    if [ "$ipv6_was_disabled" -eq 1 ]; then
+        sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1
+        sysctl -w net.ipv6.conf.default.disable_ipv6=0 >/dev/null 2>&1
+        log_info "  - 内核 IPv6 已重新启用"
     fi
     
     # Swap
