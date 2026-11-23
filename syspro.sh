@@ -145,6 +145,8 @@ DNS_SELECT_ENABLED=1          # 1 = configure_dns 写盘前自动执行选优（
 DNS_PROBE_TRIES=3             # 每个 nameserver 的探测次数（成功 1 次即保留）
 DNS_PROBE_TIMEOUT=2           # 单次 dig 查询超时（秒）
 DNS_PROBE_DOMAINS="example.com www.qq.com www.baidu.com"  # 轮换查询的真实域名
+# FIX-P3-14: verify_resolv 的超时统一到这里，避免散落的硬编码 6 秒
+DNS_VERIFY_TIMEOUT=6          # 写盘后解析验证的超时（秒）
 
 # 权限相关常量
 FILE_PERMISSION=644           # 配置文件权限
@@ -2758,12 +2760,12 @@ verify_resolv() {
     if have dig; then
         while read -r ns; do
             [[ -z "$ns" ]] && continue
-            timeout 6 dig +short +time=3 +tries=1 "@$ns" cloudflare.com A >/dev/null 2>&1 && return 0
+            timeout "${DNS_VERIFY_TIMEOUT:-6}" dig +short +time="${DNS_PROBE_TIMEOUT:-2}" +tries=1 "@$ns" cloudflare.com A >/dev/null 2>&1 && return 0
         done < <(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null)
         # 没有可直连的 nameserver（如 DoH 的 127.0.0.1 场景）才退回系统解析
     fi
     if have getent; then
-        timeout 6 getent hosts cloudflare.com >/dev/null 2>&1 && return 0
+        timeout "${DNS_VERIFY_TIMEOUT:-6}" getent hosts cloudflare.com >/dev/null 2>&1 && return 0
     fi
     return 1
 }
@@ -3289,6 +3291,18 @@ bbrplus_preflight() {
         log_err "未找到 /boot/grub/grub.cfg（U-Boot / 容器环境不做内核切换）"
         return 1
     }
+    # FIX-P3-10: 换内核前校验 grub 环境可写，遵循"宁可中止、不可假成功"。
+    # grubenv 不可写时 grub-reboot/grub-set-default 会返回 0 却写不进 next_entry，
+    # 导致一次性启动的安全网失效。
+    local grubenv="/boot/grub/grubenv"
+    if [ -f "$grubenv" ] && ! [ -w "$grubenv" ]; then
+        log_err "grubenv 不可写（$grubenv），grub-reboot 将无法设置一次性启动项"
+        return 1
+    fi
+    if ! grub-editenv list >/dev/null 2>&1; then
+        log_err "grub-editenv 无法读取环境块（$grubenv），中止换内核"
+        return 1
+    fi
     have python3 || log_warn "  - 没有 python3，将用 grep 解析 GitHub release 资产"
     avail_kb=$(df -Pk /boot 2>/dev/null | awk 'NR==2{print $4}')
     case "$avail_kb" in ''|*[!0-9]*) avail_kb=0 ;; esac
@@ -3989,13 +4003,23 @@ cleanup_network() {
     fi
     
     # 清理防火墙规则（兼容早期版本可能留下的 53 端口规则）
+    # FIX-P3-9: 这些规则是 v5.3 老版本留下的，本脚本当前版本从不添加 iptables 规则。
+    # 只有当确认本脚本曾部署过 DoH（服务文件或标记存在）时才清理，避免误删用户
+    # 自己添加的、规则内容恰好相同的 53 端口规则。
     local DEFAULT_IFACE
     DEFAULT_IFACE=$(ip route 2>/dev/null | awk '/^default/ {print $5; exit}')
-    if [ -n "$DEFAULT_IFACE" ] && command -v iptables >/dev/null 2>&1; then
-        iptables -D INPUT -i "$DEFAULT_IFACE" -p udp --dport 53 -j DROP 2>/dev/null
-        iptables -D INPUT -i "$DEFAULT_IFACE" -p tcp --dport 53 -j DROP 2>/dev/null
-        iptables -D INPUT -i docker0 -p udp --dport 53 -j ACCEPT 2>/dev/null
-        iptables -D INPUT -i docker0 -p tcp --dport 53 -j ACCEPT 2>/dev/null
+    local had_doh=0
+    [ -f /etc/systemd/system/syspro-doh.service ] || [ -f "$MARK_DOH" ] && had_doh=1
+    if [ "$had_doh" -eq 1 ] && [ -n "$DEFAULT_IFACE" ] && command -v iptables >/dev/null 2>&1; then
+        # -C 先检查规则存在再 -D，避免盲目删除
+        iptables -C INPUT -i "$DEFAULT_IFACE" -p udp --dport 53 -j DROP 2>/dev/null \
+            && iptables -D INPUT -i "$DEFAULT_IFACE" -p udp --dport 53 -j DROP 2>/dev/null
+        iptables -C INPUT -i "$DEFAULT_IFACE" -p tcp --dport 53 -j DROP 2>/dev/null \
+            && iptables -D INPUT -i "$DEFAULT_IFACE" -p tcp --dport 53 -j DROP 2>/dev/null
+        iptables -C INPUT -i docker0 -p udp --dport 53 -j ACCEPT 2>/dev/null \
+            && iptables -D INPUT -i docker0 -p udp --dport 53 -j ACCEPT 2>/dev/null
+        iptables -C INPUT -i docker0 -p tcp --dport 53 -j ACCEPT 2>/dev/null \
+            && iptables -D INPUT -i docker0 -p tcp --dport 53 -j ACCEPT 2>/dev/null
         log_info "  - 防火墙规则已清理"
     fi
     
