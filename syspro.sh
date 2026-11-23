@@ -26,7 +26,9 @@ DNS_IPV4_LIST="76.76.2.0
 8.8.8.8"
 
 # 2. 标准 UDP 模式使用的 IPv6 DNS (每行一个)
-DNS_IPV6_LIST="2606:1a40::
+# FIX-P2-6: 原第一项 2606:1a40:: 是 Control D 的 /64 网段前缀而非具体解析器地址，
+# 作为 nameserver 通常不可达，白白浪费一次探测。换成两个明确的公共 IPv6 解析器。
+DNS_IPV6_LIST="2606:4700:4700::1111
 2001:4860:4860::8888"
 
 # 3. DoH (DNS over HTTPS) 上游地址 (Cloudflared 专用)
@@ -290,7 +292,11 @@ snapshot_sysctl() {
 # 把快照里的内核参数逐条写回去。
 # 注意: 只回放"我们确实记录过"的键，绝不猜测内核默认值。
 restore_sysctl_snapshots() {
-    local line k v n=0 failed=0
+    local line k v n=0 failed=0 cur
+    # FIX-P2-5: 容量型"地板"参数由 nftx 按实测只增不减地调，卸载时不应把
+    # nftx 的成果降回脚本运行前的旧值。这些键回滚时若当前值已高于快照值，
+    # 保留当前值（不降级）；其余参数照常精确回滚。
+    local floor_keys=" net.core.somaxconn net.ipv4.tcp_max_syn_backlog net.core.netdev_max_backlog net.core.netdev_budget net.core.netdev_budget_usecs fs.nr_open fs.file-max fs.epoll.max_user_watches "
     [ -f "$STATE_FILE" ] || return 0
     while IFS= read -r line; do
         case "$line" in SYSCTL:*) ;; *) continue ;; esac
@@ -299,6 +305,19 @@ restore_sysctl_snapshots() {
         v=${line#*|}
         [ -n "$k" ] && [ -n "$v" ] || continue
         sysctl_key_exists "$k" || continue
+        # 地板键：当前值高于快照值时保留（nftx 或他人上调过）
+        case "$floor_keys" in
+            *" $k "*)
+                cur=$(sysctl -n "$k" 2>/dev/null </dev/null)
+                case "$cur" in ''|*[!0-9]*) cur=0 ;; esac
+                case "$v" in ''|*[!0-9]*) : ;; *)
+                    if [ "$cur" -gt "$v" ]; then
+                        log_info "  - $k 当前值 $cur 高于快照 $v，保留高值（不抹掉 nftx 调整）"
+                        continue
+                    fi
+                ;; esac
+                ;;
+        esac
         # </dev/null: 这个循环本身从 $STATE_FILE 读 stdin，任何会读 stdin 的子命令
         # 都会把后面的记录吃掉，导致"只回滚了第一条"。
         if sysctl -w "$k=$v" >/dev/null 2>&1 < /dev/null; then
@@ -410,7 +429,9 @@ cleanup_on_exit() {
     [ -n "${BBR_TMP:-}" ] && rm -f "$BBR_TMP" 2>/dev/null
     # mktemp -d 创建的临时解包目录，Ctrl-C 时一并清掉（只在 /tmp 下）
     case "${BBRPLUS_TMP:-}" in
-        /tmp/syspro-bbrplus.*) rm -rf "$BBRPLUS_TMP" 2>/dev/null ;;
+        # FIX-P2-2: 原模式 /tmp/syspro-bbrplus.* 匹配不上 bbrplus-check 创建的
+        # /tmp/syspro-bbrplus-check.XXXXXX，Ctrl-C 时会残留临时目录
+        /tmp/syspro-bbrplus*) rm -rf "$BBRPLUS_TMP" 2>/dev/null ;;
     esac
     return 0
 }
@@ -649,6 +670,28 @@ svc_restore() {
 #   配置验证函数
 # ==============================================================================
 
+# FIX-P1-11/P1-12: 统一的 IPv6 可用性判据，供 DNS 配置与 gai.conf 共用。
+# 原代码两处口径不一：DNS 层要求"默认路由+全局地址"，gai 层只要"全局地址"；
+# 且都只看地址存在性，不看出口是否真的可达。
+# has_global_ipv6: 有默认路由且有全局地址（格式判断）
+has_global_ipv6() {
+    command -v ip >/dev/null 2>&1 || return 1
+    ip -6 route show default 2>/dev/null | grep -q '^default' || return 1
+    ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'
+}
+
+# ipv6_reachable: 全局 v6 存在且出口实测可达（用 dig 直连公共 IPv6 DNS）。
+# 无 dig/无 ping6 时保守返回 1（视为可达），避免因探测工具缺失而误判为无 v6。
+ipv6_reachable() {
+    has_global_ipv6 || return 1
+    if have dig; then
+        timeout 4 dig +short +time=2 +tries=1 @2606:4700:4700::1111 cloudflare.com A >/dev/null 2>&1 && return 0
+        timeout 4 dig +short +time=2 +tries=1 @2001:4860:4860::8888 cloudflare.com A >/dev/null 2>&1 && return 0
+        return 1
+    fi
+    return 0
+}
+
 validate_ipv4() {
     local ip=$1 octet
     [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
@@ -661,15 +704,25 @@ validate_ipv4() {
 }
 
 validate_ipv6() {
-    local ip=$1 grp
+    local ip=$1 grp n=0 has_compress=0
     [[ $ip == *:* ]] || return 1
     [[ $ip =~ ^[0-9a-fA-F:]+$ ]] || return 1
     [[ $ip == *::*::* ]] && return 1     # 不允许出现两个 "::"
+    [[ $ip == *:::* ]] && return 1       # FIX-P2-1: 拒绝 ::: 这类三个以上连续冒号
+    [[ $ip == *::* ]] && has_compress=1
+    # FIX-P2-1: 原实现不校验组数，:::/1:2/九组地址都被误判合法。
+    # 展开后总组数必须 <=8；无 "::" 压缩时必须正好 8 组。
     local IFS=':'
     for grp in $ip; do
         [ -z "$grp" ] && continue
         [[ $grp =~ ^[0-9a-fA-F]{1,4}$ ]] || return 1
+        n=$((n + 1))
     done
+    if [ "$has_compress" -eq 1 ]; then
+        [ "$n" -le 7 ] || return 1    # 有 :: 但非空组已达 8 组，非法
+    else
+        [ "$n" -eq 8 ] || return 1
+    fi
     return 0
 }
 
@@ -1239,15 +1292,25 @@ optimize_memory() {
         # 只清理本脚本自己装的东西，不要动用户的 zram-tools / zram-generator。
         # 判据必须是"标记文件"或"unit 内容里的签名"，不能只看文件名还在不在。
         if [ -f "$MARK_ZRAM" ] || is_syspro_zram_unit; then
-            # 先把 zram 上的换出页读回内存再卸载，否则直接删服务会丢掉仍在 swap 里的页
+            # FIX-P0-3: swapoff 失败说明换出页还没读回内存。此时若照旧删掉
+            # zram.service 与标记文件，下次运行就"忘记"zram 仍在，会把 swappiness
+            # 写回 10 导致 zram 闲置、小内存机器易 OOM；设备在重启前被 reset 还会
+            # 真正丢掉驻留页。所以卸载失败时保留 unit 与标记，等下次能成功时再删。
+            local zram_busy=0
             if grep -q '^/dev/zram0' /proc/swaps 2>/dev/null; then
-                swapoff /dev/zram0 >/dev/null 2>&1 || \
-                    log_warn "zram 仍有页面占用，未能卸载，将在重启后释放"
+                if swapoff /dev/zram0 >/dev/null 2>&1; then
+                    :
+                else
+                    zram_busy=1
+                    log_warn "zram 仍有页面占用，未能卸载；保留配置与标记，待下次重试"
+                fi
             fi
-            systemctl disable --now zram >/dev/null 2>&1
-            rm -f /etc/systemd/system/zram.service /usr/local/bin/zram-start.sh "$MARK_ZRAM"
-            systemctl daemon-reload 2>/dev/null
-            log_info "已移除本脚本创建的 ZRAM 配置。"
+            if [ "$zram_busy" -eq 0 ]; then
+                systemctl disable --now zram >/dev/null 2>&1
+                rm -f /etc/systemd/system/zram.service /usr/local/bin/zram-start.sh "$MARK_ZRAM"
+                systemctl daemon-reload 2>/dev/null
+                log_info "已移除本脚本创建的 ZRAM 配置。"
+            fi
         elif [ -f /etc/systemd/system/zram.service ]; then
             log_info "检测到非本脚本创建的 zram.service，已保留。"
         fi
@@ -1982,6 +2045,20 @@ optimize_net_floor() {
 install_cloudflared() {
     log_info "开始部署 Cloudflared DoH 客户端 (容器稳定性增强版)..."
 
+    # FIX-P1-7: AmbientCapabilities= 需要 systemd 229+。CentOS 7 是 systemd 219，
+    # 该指令不识别会导致 unit 加载失败、DoH 部署整个退回 UDP。
+    # 旧 systemd 改用 Capabilities=...+ep + SecureBits=keep-caps 达到同样效果。
+    local cap_lines sd_ver=0
+    sd_ver=$(systemctl --version 2>/dev/null | awk 'NR==1 {print $2}')
+    case "$sd_ver" in ''|*[!0-9]*) sd_ver=0 ;; esac
+    if [ "$sd_ver" -ge 229 ]; then
+        cap_lines="AmbientCapabilities=CAP_NET_BIND_SERVICE"
+    else
+        cap_lines="Capabilities=CAP_NET_BIND_SERVICE+ep
+SecureBits=keep-caps"
+        log_info "  - systemd ${sd_ver} 较旧，使用 Capabilities= 替代 AmbientCapabilities="
+    fi
+
     # --- 0. 依赖检查 ---
     # 旧版本要等到"模块 6 维护清理"才安装 curl，而这里第 3 行就要用它，
     # 最小化镜像上 DoH 必然失败，用户还会以为是网络问题。
@@ -2072,7 +2149,7 @@ Wants=network-online.target
 Type=simple
 User=cloudflared
 # 只监听本地回环，避免变成公网开放递归解析器（会被用于 DNS 放大攻击）
-AmbientCapabilities=CAP_NET_BIND_SERVICE
+${cap_lines}
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 ExecStart=/usr/local/bin/cloudflared proxy-dns --port 53 --address ${DOH_LISTEN_ADDR} ${upstream_args} --bootstrap-dns 1.1.1.1
 Restart=always
@@ -2282,13 +2359,19 @@ EOF
 dns_probe_one() {
     local srv=$1 dom=$2 out t0 t1 ms
     have dig || return 1
-    t0=$(date +%s%N 2>/dev/null); case "$t0" in ''|*[!0-9]*) t0=0 ;; esac
+    # FIX-P2-4: 优先用 %s%3N（毫秒，GNU date），BusyBox 不支持时退回秒级 %s*1000，
+    # 避免 %N 输出字面量导致延迟恒为 0
+    t0=$(date +%s%3N 2>/dev/null); case "$t0" in ''|*[!0-9]*)
+        t0=$(date +%s 2>/dev/null); case "$t0" in ''|*[!0-9]*) t0=0 ;; *) t0=$((t0 * 1000)) ;; esac
+    ;; esac
     out=$(dig +time="${DNS_PROBE_TIMEOUT:-2}" +tries=1 +noall +answer "@$srv" "$dom" A 2>/dev/null)
-    t1=$(date +%s%N 2>/dev/null); case "$t1" in ''|*[!0-9]*) t1=$t0 ;; esac
+    t1=$(date +%s%3N 2>/dev/null); case "$t1" in ''|*[!0-9]*)
+        t1=$(date +%s 2>/dev/null); case "$t1" in ''|*[!0-9]*) t1=$t0 ;; *) t1=$((t1 * 1000)) ;; esac
+    ;; esac
     if ! grep -qE '[[:space:]]IN[[:space:]]+A[[:space:]]+[0-9]{1,3}(\.[0-9]{1,3}){3}[[:space:]]*$' <<< "$out"; then
         return 1
     fi
-    ms=$(( (t1 - t0) / 1000000 ))
+    ms=$(( (t1 - t0) ))   # FIX-P2-4: t0/t1 已是毫秒，无需再除 1000000
     case "$ms" in ''|*[!0-9]*) ms=0 ;; esac
     printf 'ok %s' "$ms"
 }
@@ -2465,12 +2548,16 @@ restore_nss_resolve() {
 # 收益很小（防止被 dhclient 改回去），代价极大: DoH 进程开机没起来时，
 # 机器会同时处于"DNS 全挂"和"文件改不动"两个状态，只能靠云控制台 chattr -i 抢救。
 lock_resolv_if_requested() {
+    # FIX-P0-2: 加锁目标必须与实际改写的 resolv.conf 一致。
+    # CLI `dns apply <自定义文件>` 会改写自定义路径，若此处仍硬编码 /etc/resolv.conf，
+    # 会给一个根本没被本命令改动的文件加上 immutable，导致 dhclient/cloud-init 无法回写。
+    local target="${1:-/etc/resolv.conf}"
     if [ "${DNS_LOCK_IMMUTABLE:-0}" != "1" ]; then
-        log_info "  - /etc/resolv.conf 保持可写（如需加锁请把 DNS_LOCK_IMMUTABLE 改为 1）"
+        log_info "  - ${target} 保持可写（如需加锁请把 DNS_LOCK_IMMUTABLE 改为 1）"
         return 0
     fi
-    if chattr +i /etc/resolv.conf >/dev/null 2>&1; then
-        log_warn "  - 已按要求锁定 /etc/resolv.conf；解锁: chattr -i /etc/resolv.conf"
+    if chattr +i "$target" >/dev/null 2>&1; then
+        log_warn "  - 已按要求锁定 ${target}；解锁: chattr -i ${target}"
         log_warn "  - 注意: DoH 进程异常时本机将无法解析、也无法直接修改该文件"
     else
         log_info "  - 文件系统不支持 immutable 属性，保持可写"
@@ -2537,9 +2624,28 @@ EOF
             log_err "DoH 已启动但解析验证失败，回退到标准 UDP 模式。"
             # 停掉没在用的 DoH 服务，避免它继续占着 53 端口
             systemctl disable --now syspro-doh >/dev/null 2>&1
+            # FIX-P1-1: DoH 部署时 mask 了 resolved、摘掉了 nsswitch 的 resolve；
+            # 回退 UDP 必须撤销这两个副作用，否则机器停留在状态不一致。
+            restore_nss_resolve
+            if state_has "SVC:systemd-resolved"; then
+                svc_restore systemd-resolved
+                systemctl start systemd-resolved >/dev/null 2>&1
+            elif [ "$(systemctl is-enabled systemd-resolved 2>/dev/null)" = "masked" ]; then
+                systemctl unmask systemd-resolved >/dev/null 2>&1
+                systemctl enable --now systemd-resolved >/dev/null 2>&1
+            fi
             DNS_CHOICE="1"
         else
             log_warn "DoH 部署失败，自动回退到标准 UDP 模式。"
+            # FIX-P1-1: 同上，撤销 DoH 部署阶段对 resolved / nsswitch 的副作用
+            restore_nss_resolve
+            if state_has "SVC:systemd-resolved"; then
+                svc_restore systemd-resolved
+                systemctl start systemd-resolved >/dev/null 2>&1
+            elif [ "$(systemctl is-enabled systemd-resolved 2>/dev/null)" = "masked" ]; then
+                systemctl unmask systemd-resolved >/dev/null 2>&1
+                systemctl enable --now systemd-resolved >/dev/null 2>&1
+            fi
             DNS_CHOICE="1"
         fi
     fi
@@ -2576,7 +2682,8 @@ EOF
         # IPv6 DNS 只在"有默认路由且有全局地址"时才尝试。
         # 注意: 探测失败只跳过这一条 DNS，绝不再去动内核的 disable_ipv6 开关
         #       （v5.3 就是在这里把整机 IPv6 关掉的）。
-        if ip -6 route show default >/dev/null 2>&1 && ip -6 addr show scope global 2>/dev/null | grep -q inet6; then
+        # FIX-P1-12: 统一走 has_global_ipv6，与 gai 层口径一致
+        if has_global_ipv6; then
             log_info "正在测试 IPv6 DNS 服务器连通性..."
             while read -r ip; do
                 [[ -z "$ip" || "$ip" =~ ^# ]] && continue
@@ -2613,22 +2720,50 @@ EOF
             lock_resolv_if_requested
             log_success "标准 DNS 模式已生效（解析已验证）。"
         else
-            # 关键: 验证失败时不要加锁，给用户留一条自救的路
-            log_err "DNS 写入后解析验证失败，已保持 /etc/resolv.conf 可写（未加锁）。"
-            log_warn "请检查网络连通性，或恢复备份: cp /etc/resolv.conf.syspro.bak /etc/resolv.conf"
+            # FIX-P0-1: 验证失败必须自动回滚，否则一组不可达 DNS 会被永久留下，
+            # 远程机器在 DNS 失效时等于失联。此前只打日志让用户手动恢复，违背可回滚承诺。
+            log_err "DNS 写入后解析验证失败，正在自动回滚。"
+            rollback_resolv_conf || \
+                log_warn "回滚未完成，请手动恢复: cp -p /etc/resolv.conf.syspro.bak /etc/resolv.conf"
             return 1
         fi
     fi
 }
 
+# FIX-P0-1: DNS 写入后验证失败时自动回滚到原始 resolv.conf。
+# configure_dns 在改动前已把原文件备份为 /etc/resolv.conf.syspro.bak；
+# 验证失败若不回滚，就会把一组不可达 DNS 永久留在机器上，远程机器等于失联。
+# 返回: 0 = 已回滚, 1 = 无法回滚（备份缺失或 mv 失败）
+rollback_resolv_conf() {
+    local bak="/etc/resolv.conf.syspro.bak"
+    chattr -i /etc/resolv.conf >/dev/null 2>&1
+    if [ -e "$bak" ] || [ -L "$bak" ]; then
+        if mv -f "$bak" /etc/resolv.conf 2>/dev/null; then
+            log_warn "  - 解析验证失败，已自动回滚 /etc/resolv.conf 到原始配置"
+            return 0
+        fi
+        log_err "  - 自动回滚失败！请手动: cp -p ${bak} /etc/resolv.conf"
+        return 1
+    fi
+    log_err "  - 找不到原始备份 ${bak}，无法自动回滚；请手动恢复 DNS"
+    return 1
+}
+
 # 验证 resolv.conf 是否真的可用
-# 只看"文件写进去了"是不够的，必须走一次真实的解析（getent 走 glibc → /etc/resolv.conf）
+# FIX-P1-2: getent hosts 走 nsswitch 的 files dns，会先查 /etc/hosts。
+# 若代理/科学上网工具在 hosts 里绑定了探测域名，DNS 全坏也会误报成功，掩盖 P0-1。
+# 改为优先用 dig 直连实际写入的 nameserver（绕过 hosts），getent 仅作兜底。
 verify_resolv() {
+    local ns
+    if have dig; then
+        while read -r ns; do
+            [[ -z "$ns" ]] && continue
+            timeout 6 dig +short +time=3 +tries=1 "@$ns" cloudflare.com A >/dev/null 2>&1 && return 0
+        done < <(awk '/^[[:space:]]*nameserver[[:space:]]+/ {print $2}' /etc/resolv.conf 2>/dev/null)
+        # 没有可直连的 nameserver（如 DoH 的 127.0.0.1 场景）才退回系统解析
+    fi
     if have getent; then
         timeout 6 getent hosts cloudflare.com >/dev/null 2>&1 && return 0
-    fi
-    if have dig; then
-        timeout 6 dig +short +time=3 +tries=1 cloudflare.com >/dev/null 2>&1 && return 0
     fi
     return 1
 }
@@ -2648,13 +2783,15 @@ tune_gai_preference() {
         return 0
     fi
 
-    # 有全局 IPv6 地址 = 双栈/纯 v6 机器。强开 v4 优先会跳过一条可能更快/唯一可用的
-    # 路径，所以只在"确实没有全局 v6"时才调 —— 跟"时区不能替用户拍板"是同一个原则。
-    if ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'; then
+    # FIX-P1-11: 判据从"有全局地址"升级为"有全局地址且出口实测可达"。
+    # 原逻辑只看地址存在性：机器有全局 v6 但出口不通时误判为双栈、保持默认排序，
+    # getaddrinfo 仍把 AAAA 排最前，不支持 Happy Eyeballs 的程序照样卡顿几秒。
+    # 只有真正可达的双栈机器才跳过 IPv4 优先。
+    if ipv6_reachable; then
         # 机器后来有了 v6（之前无 v6 时期写过 v4 优先）：还原掉，别让旧偏好干扰双栈
         [ -f "${gai}.syspro.bak" ] && \
             restore_from_backup "${gai}.syspro.bak" "$gai" "gai.conf 地址选择"
-        log_info "检测到全局 IPv6 地址，保持系统默认地址选择。"
+        log_info "检测到可达的全局 IPv6，保持系统默认地址选择。"
         return 0
     fi
 
@@ -3072,11 +3209,20 @@ bbrplus_menu_id() {
 }
 
 # grub-reboot / grub-set-default 需要 "子菜单>条目" 的完整路径
+# FIX-P1-3: 原先对整个 grub.cfg 取 head -1 得到 adv，双系统/多盘时第一个子菜单
+# 未必是 bbrplus 条目所在的那个。改为从 ent 的 UUID 后缀反推匹配的 adv。
 bbrplus_full_menu_id() {
-    local ent adv
+    local ent adv uuid
     ent=$(bbrplus_menu_id) || return 1
-    adv=$(grep -oE "gnulinux-advanced-[0-9a-fA-F-]+" /boot/grub/grub.cfg 2>/dev/null | head -1)
-    if [ -n "$adv" ]; then printf '%s>%s' "$adv" "$ent"; else printf '%s' "$ent"; fi
+    uuid=${ent##*-}
+    adv=$(grep -oE "gnulinux-advanced-[0-9a-fA-F-]+" /boot/grub/grub.cfg 2>/dev/null \
+          | grep -F -- "-$uuid" | head -1)
+    if [ -n "$adv" ]; then
+        printf '%s>%s' "$adv" "$ent"
+    else
+        # 找不到同 UUID 的子菜单时，退回纯条目 ID（grub 仍可在顶层匹配）
+        printf '%s' "$ent"
+    fi
 }
 
 # 只读：算出"回退内核"在 grub.cfg 里的完整菜单 ID。
@@ -3090,7 +3236,10 @@ bbrplus_rollback_target_id() {
     fb_pat=$(printf '%s' "$fb" | sed 's/[.+]/\\&/g')
     fb_id=$(grep -oE "gnulinux-${fb_pat}-advanced-[0-9a-fA-F-]+" /boot/grub/grub.cfg 2>/dev/null | head -1)
     [ -n "$fb_id" ] || return 1
-    adv=$(grep -oE "gnulinux-advanced-[0-9a-fA-F-]+" /boot/grub/grub.cfg 2>/dev/null | head -1)
+    # FIX-P1-3: 同 bbrplus_full_menu_id，按 UUID 后缀匹配所属子菜单
+    local fb_uuid=${fb_id##*-}
+    adv=$(grep -oE "gnulinux-advanced-[0-9a-fA-F-]+" /boot/grub/grub.cfg 2>/dev/null \
+          | grep -F -- "-$fb_uuid" | head -1)
     if [ -n "$adv" ]; then printf '%s>%s' "$adv" "$fb_id"; else printf '%s' "$fb_id"; fi
 }
 
@@ -3248,7 +3397,12 @@ bbrplus_install_pkgs() {
     cur=$(uname -r)
     fb=$(bbrplus_find_fallback) || return 1
     dflt=$(awk -F= '/^GRUB_DEFAULT=/{print $2}' /etc/default/grub 2>/dev/null)
-    printf '%s' "$dflt" | grep -qE '^[A-Za-z0-9_.>-]+$' || dflt=0
+    # FIX-P1-4: GRUB_DEFAULT 合法值可以是带空格的菜单标题，如 "Ubuntu, with Linux 6.12"。
+    # 原正则拒绝空格/引号导致 dflt 被强制置 0，回滚后启动项就错了。
+    # 放宽为"非空且不含 shell 注入字符"，带空格/引号的标题原样保留。
+    if [ -z "$dflt" ] || printf '%s' "$dflt" | grep -qE '[\n\r`$();&|<>]'; then
+        dflt=0
+    fi
     saved=$(grub-editenv list 2>/dev/null | awk -F= '/^saved_entry=/{print $2}')
 
     mkdir -p "$BBRPLUS_BACKUP_DIR" 2>/dev/null || { log_err "无法创建备份目录"; return 1; }
@@ -3293,7 +3447,20 @@ bbrplus_install_pkgs() {
     bbrplus_rollback_put "BBRPLUS_MENU_ID" "$full"
     # 一次性启动：不改 GRUB_DEFAULT。起不来下次重启自动回原内核
     grub-reboot "$full" || { log_err "grub-reboot 设置失败"; return 1; }
-    log_success "  - 已设置一次性启动项: $full"
+    # FIX-P1-6: grub-reboot 返回 0 不代表引导程序真的会读 next_entry。
+    # 校验 grubenv 中确实写入了 next_entry，且生成的 grub.cfg 含读取它的逻辑，
+    # 否则"失败自动回原内核"的安全网是假的。
+    local next_entry
+    next_entry=$(grub-editenv list 2>/dev/null | awk -F= '/^next_entry=/{print $2}')
+    if [ -z "$next_entry" ]; then
+        log_err "grub-reboot 未生效：grubenv 中没有 next_entry，放弃一次性启动"
+        return 1
+    fi
+    if ! grep -qE '\$\{?next_entry' /boot/grub/grub.cfg 2>/dev/null; then
+        log_warn "  - grub.cfg 未检测到 next_entry 读取逻辑；该 GRUB 配置可能忽略一次性启动项"
+        log_warn "  - 若重启后未进入 bbrplus，请用 bbrplus-confirm 手动设为默认"
+    fi
+    log_success "  - 已设置一次性启动项: $full（grubenv next_entry 已确认）"
     log_info "  - GRUB_DEFAULT 保持原值 '${dflt}'，未改持久默认（失败自动回退）"
 
     if [ "${BBRPLUS_KEEP_DEB:-1}" = "1" ]; then
@@ -3326,7 +3493,18 @@ bbrplus_confirm() {
         printf '\nGRUB_DEFAULT=saved\n' >> /etc/default/grub || return 1
     fi
     grub-set-default "$full" || { log_err "grub-set-default 失败"; return 1; }
-    update-grub >/dev/null 2>&1
+    # FIX-P1-5: update-grub 失败会导致 /etc/default/grub 已改但 grub.cfg 未同步，
+    # 用户却看到"已设为持久默认"的假成功。失败时回滚本次修改并报错。
+    if ! update-grub >/dev/null 2>&1; then
+        log_err "update-grub 失败，正在回滚 GRUB_DEFAULT 修改"
+        if grep -qE '^GRUB_DEFAULT=' "$BBRPLUS_BACKUP_DIR/default.grub" 2>/dev/null; then
+            cp -p "$BBRPLUS_BACKUP_DIR/default.grub" /etc/default/grub 2>/dev/null
+        else
+            sed -i 's/^GRUB_DEFAULT=.*/GRUB_DEFAULT=saved/' /etc/default/grub 2>/dev/null
+        fi
+        log_err "请检查 /boot 空间与 grub 配置后重试 bbrplus-confirm"
+        return 1
+    fi
     # 内核若是在 syspro 之外装的（手工 dpkg -i），rollback.env 里没有回退记录；
     # 这里补一条，保证后续 rollback 仍能定位到原内核的菜单项。
     fb=$(bbrplus_find_fallback 2>/dev/null)
@@ -3342,7 +3520,8 @@ bbrplus_rollback() {
     local dflt saved fb fb_target=""
     dflt=$(bbrplus_rollback_get "GRUB_DEFAULT" 2>/dev/null)
     [ -n "$dflt" ] || dflt=0
-    printf '%s' "$dflt" | grep -qE '^[A-Za-z0-9_.>-]+$' || dflt=0
+    # FIX-P1-4: 与安装侧一致，允许带空格/引号的合法菜单标题，只拒绝注入字符
+    if printf '%s' "$dflt" | grep -qE '[\n\r`$();&|<>]'; then dflt=0; fi
     saved=$(bbrplus_rollback_get "SAVED_ENTRY" 2>/dev/null)
     fb=$(bbrplus_rollback_get "FALLBACK_KERNEL" 2>/dev/null)
     [ -n "$fb" ] || fb=$(bbrplus_find_fallback 2>/dev/null)
@@ -3350,6 +3529,9 @@ bbrplus_rollback() {
     # 没有安装记录时也要精确回到原内核，而不是笼统地 "第 1 项"
     fb_target=$(bbrplus_rollback_target_id 2>/dev/null)
 
+    # FIX-P1-5: 先备份即将改写的 /etc/default/grub，任一步失败可回滚
+    local grub_snapshot="${BBRPLUS_BACKUP_DIR}/default.grub.pre-rollback"
+    cp -p /etc/default/grub "$grub_snapshot" 2>/dev/null
     if grep -qE '^GRUB_DEFAULT=' /etc/default/grub 2>/dev/null; then
         sed -i "s|^GRUB_DEFAULT=.*|GRUB_DEFAULT=${dflt}|" /etc/default/grub || return 1
     else
@@ -3357,14 +3539,20 @@ bbrplus_rollback() {
     fi
     grub-editenv /boot/grub/grubenv unset next_entry >/dev/null 2>&1 \
         || grub-editenv - unset next_entry >/dev/null 2>&1 || true
+    local set_default_ok=0
     if [ -n "$fb_target" ]; then
-        grub-set-default "$fb_target" >/dev/null 2>&1
+        grub-set-default "$fb_target" >/dev/null 2>&1 && set_default_ok=1
     elif [ -n "$saved" ]; then
-        grub-set-default "$saved" >/dev/null 2>&1 || grub-set-default 0 >/dev/null 2>&1
+        { grub-set-default "$saved" >/dev/null 2>&1 || grub-set-default 0 >/dev/null 2>&1; } && set_default_ok=1
     else
-        grub-set-default 0 >/dev/null 2>&1
+        grub-set-default 0 >/dev/null 2>&1 && set_default_ok=1
     fi
-    update-grub >/dev/null 2>&1
+    if ! update-grub >/dev/null 2>&1 || [ "$set_default_ok" -ne 1 ]; then
+        log_err "grub-set-default 或 update-grub 失败，正在回滚 GRUB_DEFAULT 修改"
+        [ -f "$grub_snapshot" ] && cp -p "$grub_snapshot" /etc/default/grub 2>/dev/null
+        log_err "GRUB 配置可能处于半更新状态，请检查后重试 bbrplus-rollback"
+        return 1
+    fi
     log_success "已恢复 GRUB_DEFAULT=${dflt}，并清除一次性启动项"
     log_info "回退目标: ${fb_target:-${saved:-菜单第 1 项}}（${fb:-原内核}）"
     log_info "bbrplus 内核包仍保留，可再用 bbrplus-confirm 切回"
@@ -3723,8 +3911,11 @@ restore_logging() {
 
     log_info "检测到日志系统曾被禁用，正在恢复..."
 
+    # FIX-P2-3: 原代码 chattr -R -i /var/log 递归清除整个日志目录的 immutable，
+    # 会把管理员/合规为 audit.log 等设置的 +i 一并清掉；本脚本从未给 /var/log 加过锁。
+    # 只对本脚本确实改动的记账文件精确解锁。
     if command -v chattr >/dev/null 2>&1; then
-        chattr -R -i /var/log 2>/dev/null
+        chattr -i /var/log/wtmp /var/log/btmp /var/log/lastlog 2>/dev/null
     fi
 
     # 注意: 这里绝对不要 chmod -R 755 /var/log。
@@ -3759,7 +3950,9 @@ restore_logging() {
     # 其余服务按快照还原。
     # 旧版本在这里无条件 systemctl enable 一整串服务，等于把管理员主动禁用的
     # auditd / kdump / avahi-daemon 全部重新拉起来 —— 是"制造变更"而不是"恢复"。
-    local SERVICES=("rsyslog" "syslog" "rsyslogd" "kdump" "apport" "abrtd" "avahi-daemon" "auditd")
+    # FIX-P1-10: auditd 由 cleanup_optimizations 的 MARK_AUDIT 专用分支单一处理。
+    # 若这里也放 auditd，同一次卸载会两次 svc_restore auditd（两次服务重启窗口）。
+    local SERVICES=("rsyslog" "syslog" "rsyslogd" "kdump" "apport" "abrtd" "avahi-daemon")
     for svc in "${SERVICES[@]}"; do
         svc_restore "$svc"
     done
@@ -3823,15 +4016,20 @@ cleanup_network() {
         if [ -n "$ssh_svc" ] && systemctl reload-or-restart "$ssh_svc" 2>/dev/null; then
             log_info "  - SSH 配置已恢复"
         else
+            # FIX-P1-8: errors 此前从未递增，return 恒为 0，内部失败被吞
+            errors=$((errors + 1))
             log_warn "  - SSH 配置已恢复，但服务重载失败，请手动执行 sshd -t 检查"
         fi
     fi
-    
+
     # 恢复 Shell 环境
     rm -f /etc/profile.d/syspro.sh
 
-    # 恢复地址选择偏好（若曾被写入）
-    restore_from_backup "/etc/gai.conf.syspro.bak" "/etc/gai.conf" "gai.conf 地址选择" 2>/dev/null
+    # 恢复地址选择偏好（若曾被写入）；备份存在但恢复失败时计入错误
+    if [ -f /etc/gai.conf.syspro.bak ]; then
+        restore_from_backup "/etc/gai.conf.syspro.bak" "/etc/gai.conf" "gai.conf 地址选择" 2>/dev/null \
+            || errors=$((errors + 1))
+    fi
 
     return $errors
 }
@@ -3851,15 +4049,30 @@ restore_dns() {
     # v5.3 直接写死 8.8.8.8，会把 DHCP / cloud-init 下发的内网 DNS 永久丢掉。
     local rc=0 restored=0
     if [ -e /etc/resolv.conf.syspro.bak ] || [ -L /etc/resolv.conf.syspro.bak ]; then
-        # 用 mv -f 直接覆盖，不要先 rm: 万一是跨设备/权限问题导致 mv 失败，
-        # 先 rm 会让机器连一个 resolv.conf 都不剩。
-        if mv -f /etc/resolv.conf.syspro.bak /etc/resolv.conf; then
-            log_info "  - /etc/resolv.conf 已按原始备份恢复"
-            restored=1
-        else
-            log_err "  - 恢复 /etc/resolv.conf 失败，请手动处理"
-            rc=1
-        fi
+        # FIX-P1-9: 恢复前校验当前文件是否仍带本脚本签名。
+        # 本脚本写入的 resolv.conf 首行是 "# SysPro ..."；若当前文件不含该签名，
+        # 说明优化之后又被用户/cloud-init/DHCP/Ansible 重新下发过，此时用旧备份
+        # 覆盖会永久丢失那些后续修改。保留当前文件，仅提示用户。
+        local current_signature=""
+        [ -f /etc/resolv.conf ] && current_signature=$(head -1 /etc/resolv.conf 2>/dev/null)
+        case "$current_signature" in
+            "# SysPro"*)
+                # 用 mv -f 直接覆盖，不要先 rm: 万一是跨设备/权限问题导致 mv 失败，
+                # 先 rm 会让机器连一个 resolv.conf 都不剩。
+                if mv -f /etc/resolv.conf.syspro.bak /etc/resolv.conf; then
+                    log_info "  - /etc/resolv.conf 已按原始备份恢复"
+                    restored=1
+                else
+                    log_err "  - 恢复 /etc/resolv.conf 失败，请手动处理"
+                    rc=1
+                fi
+                ;;
+            *)
+                log_warn "  - /etc/resolv.conf 已被其他程序或用户修改（无 SysPro 标记），保留当前配置不覆盖"
+                log_info "  - 原始备份仍在 /etc/resolv.conf.syspro.bak，如需可手动比对"
+                restored=1
+                ;;
+        esac
     fi
 
     # 只要本脚本屏蔽过 systemd-resolved 就必须解除。
@@ -3869,8 +4082,12 @@ restore_dns() {
     if state_has "SVC:systemd-resolved"; then
         svc_restore systemd-resolved
         systemctl start systemd-resolved >/dev/null 2>&1
-    elif [ "$(systemctl is-enabled systemd-resolved 2>/dev/null)" = "masked" ] && [ "$restored" -eq 1 ]; then
-        # 老版本没留快照，但确实被 mask 过
+    elif [ "$(systemctl is-enabled systemd-resolved 2>/dev/null)" = "masked" ]; then
+        # FIX-P0-4: 老版本没留快照，但确实被 mask 过。
+        # 原代码附加了 `&& [ "$restored" -eq 1 ]`：只跑过优化项 1/2/3、从未执行
+        # configure_dns 的机器没有 resolv.conf 备份，restored=0，这个专为老版本
+        # 设计的 unmask 分支就永远进不来，卸载后 resolved 仍是 masked、下次开机 DNS 全挂。
+        # mask 与 resolv.conf 备份无必然关系，去掉这个条件。
         systemctl unmask systemd-resolved >/dev/null 2>&1
         systemctl enable --now systemd-resolved >/dev/null 2>&1
         log_info "  - systemd-resolved 已解除屏蔽并启用"
@@ -3899,14 +4116,21 @@ cleanup_optimizations() {
     # 判据用标记文件 / unit 内容签名，不再"同名文件存在就删"——
     # zram.service 是用户自建 unit 的常见名字。
     if [ -f "$MARK_ZRAM" ] || is_syspro_zram_unit; then
+        # FIX-P0-3: 同 optimize_memory，swapoff 失败时不可删 unit 与标记
+        local zram_busy=0
         if grep -q '^/dev/zram0' /proc/swaps 2>/dev/null; then
-            # 直接删服务会丢掉仍在 zram 里的换出页，先 swapoff 读回内存
-            swapoff /dev/zram0 >/dev/null 2>&1 || \
-                log_warn "  - zram 仍有页面占用，未能卸载，将在重启后释放"
+            if swapoff /dev/zram0 >/dev/null 2>&1; then
+                :
+            else
+                zram_busy=1
+                log_warn "  - zram 仍有页面占用，未能卸载；保留配置与标记"
+            fi
         fi
-        systemctl disable --now zram >/dev/null 2>&1
-        rm -f /etc/systemd/system/zram.service /usr/local/bin/zram-start.sh "$MARK_ZRAM"
-        log_info "  - ZRAM 已移除"
+        if [ "$zram_busy" -eq 0 ]; then
+            systemctl disable --now zram >/dev/null 2>&1
+            rm -f /etc/systemd/system/zram.service /usr/local/bin/zram-start.sh "$MARK_ZRAM"
+            log_info "  - ZRAM 已移除"
+        fi
     elif [ -f /etc/systemd/system/zram.service ]; then
         log_info "  - 检测到非本脚本的 zram.service，已保留"
     fi
@@ -3953,7 +4177,16 @@ cleanup_optimizations() {
     fi
     
     # fstab
-    restore_from_backup "/etc/fstab.syspro.bak" "/etc/fstab" "fstab 配置" && mount -o remount / 2>/dev/null
+    # FIX-P1-9: 与 resolv.conf 同理，fstab 若被用户/其他工具改过（无 SysPro 标记），
+    # 用旧备份覆盖会丢失后续修改。本脚本写入的 fstab 会在挂载选项里留下 noatime 标记。
+    if [ -f /etc/fstab.syspro.bak ]; then
+        if grep -q 'noatime' /etc/fstab 2>/dev/null; then
+            restore_from_backup "/etc/fstab.syspro.bak" "/etc/fstab" "fstab 配置" && mount -o remount / 2>/dev/null
+        else
+            log_warn "  - /etc/fstab 已被其他程序或用户修改（无 SysPro noatime 标记），保留当前配置不覆盖"
+            log_info "  - 原始备份仍在 /etc/fstab.syspro.bak，如需可手动比对"
+        fi
+    fi
     
     # Udev 规则: 新版文件名 + 旧版文件名都要处理
     local udev_changed=0
@@ -4240,7 +4473,7 @@ EOF
         [ "$_dnssub" = "apply" ] && chattr -i "$_dnsfile" 2>/dev/null
         dns_select_best "$_dnsfile" "$_dnssub" 1
         _dnsrc=$?
-        [ "$_dnssub" = "apply" ] && [ "$_dnsrc" -eq 0 ] && lock_resolv_if_requested
+        [ "$_dnssub" = "apply" ] && [ "$_dnsrc" -eq 0 ] && lock_resolv_if_requested "$_dnsfile"
         exit "$_dnsrc" ;;
     selftest|--selftest) syspro_selftest; exit $? ;;
 esac
