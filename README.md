@@ -128,9 +128,14 @@ bash syspro.sh bbrplus-confirm                 # 重启进新内核后验证并�
 bash syspro.sh bbrplus-rollback                # 恢复原 GRUB 默认项，清一次性启动项
 bash syspro.sh dns [check|apply] [文件]         # 默认 check；只剔除实测不可达的 nameserver
 bash syspro.sh selftest                        # 只读自检（函数完整性 / 语法 / 环境）
+bash syspro.sh plan                            # dry-run 预览：列出一键优化将执行的模块（不改系统）
+bash syspro.sh status-json                     # 巡检用 JSON 格式状态输出（只读）
 ```
 
 `dns check` 只报告不修改配置；`dns apply` 会写入 resolv.conf（默认 `/etc/resolv.conf`），不支持软链接。
+`plan` 只打印执行计划、不做任何写操作，适合先看清楚再决定是否执行优化。`status-json` 输出 kernel / cc / bbrplus 状态与阶段等字段，便于巡检系统采集。
+
+关于 bbrplus 阶段：`bbrplus-status` 与 `status-json` 中的 `阶段` 字段取值 `installed`（已安装待重启确认）→ `confirmed`（已设为持久默认）→ `rolled-back`（已回退）；旧版本安装的机器该字段显示 `unknown`，不影响回退功能。
 
 ---
 
