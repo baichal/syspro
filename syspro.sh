@@ -2899,14 +2899,21 @@ tune_gai_preference() {
         return 0
     fi
 
+    # FIX-RUNTIME-3: 判据是"出口可达"，不一定是"没有地址"。服务器常配有全局 IPv6
+    # 但出口不通，此时文案说"无全局 IPv6"与事实不符、误导排查，需区分两种情况。
+    if has_global_ipv6; then
+        local reason="全局 IPv6 出口不可达"
+    else
+        local reason="本机无全局 IPv6 地址"
+    fi
     {
         echo ''
-        echo '# SysPro: 无全局 IPv6，优先 IPv4（只调排序，不禁用 IPv6）'
+        echo "# SysPro: ${reason}，优先 IPv4（只调排序，不禁用 IPv6）"
         echo 'precedence ::ffff:0:0/96  100'
     } >> "$gai" || { log_err "无法写入 $gai"; return 1; }
 
-    log_success "已让 getaddrinfo 优先 IPv4（本机无全局 IPv6）。"
-    log_info "  - 立即生效于之后发起的解析；以后若有了全局 v6，重跑本项会自动还原"
+    log_success "已让 getaddrinfo 优先 IPv4（${reason}）。"
+    log_info "  - 立即生效于之后发起的解析；以后若 IPv6 出口恢复可达，重跑本项会自动还原"
     return 0
 }
 
@@ -3484,11 +3491,16 @@ bbrplus_verify_pkgs() {
             log_err "不是有效 deb: ${f##*/}"
             return 1
         fi
-        if dpkg-deb -c "$f" 2>/dev/null | grep -qF "boot/vmlinuz-${BBRPLUS_KVER}"; then
-            img=$f
-        elif dpkg-deb -c "$f" 2>/dev/null | grep -qF "linux-headers-${BBRPLUS_KVER}"; then
-            hdr=$f
-        fi
+        # FIX-RUNTIME-1: 不能用 `dpkg-deb -c | grep -q`——grep -q 匹配即退出会让
+        # 上游 dpkg-deb 收到 SIGPIPE；在 set -o pipefail 下整条管道返回非0，
+        # 即使匹配成功 if 也判假（实测稳定 rc=2），导致 bbrplus 校验永远失败、
+        # 换内核功能被完全阻断。改为把清单缓存到变量再用字符串匹配，消除管道。
+        local listing
+        listing=$(dpkg-deb -c "$f" 2>/dev/null)
+        case "$listing" in
+            *"boot/vmlinuz-${BBRPLUS_KVER}"*) img=$f ;;
+            *"linux-headers-${BBRPLUS_KVER}"*) hdr=$f ;;
+        esac
         printf '  %-62s %9s bytes  sha256=%s\n' "${f##*/}" "$(wc -c < "$f")" \
                "$(sha256sum "$f" 2>/dev/null | awk '{print $1}')"
     done
@@ -3499,8 +3511,11 @@ bbrplus_verify_pkgs() {
     dpkg-deb -x "$img" "$x" >/dev/null 2>&1 || { log_err "无法解包内核 deb"; return 1; }
     cfg=$(find "$x/boot" -maxdepth 1 -name "config-${BBRPLUS_KVER}" -print -quit 2>/dev/null)
     if [ -n "$cfg" ] && grep -q '^CONFIG_TCP_CONG_BBRPLUS=y' "$cfg"; then bbr_ok=1; fi
-    if [ "$bbr_ok" -eq 0 ] && grep -rl 'tcp_bbrplus' "$x/lib/modules" 2>/dev/null | grep -q .; then
-        bbr_ok=1
+    # FIX-RUNTIME-1: 同上，避免 `grep -rl | grep -q` 在 pipefail 下的 SIGPIPE 风险
+    if [ "$bbr_ok" -eq 0 ]; then
+        local mod_hits
+        mod_hits=$(grep -rl 'tcp_bbrplus' "$x/lib/modules" 2>/dev/null | head -1)
+        [ -n "$mod_hits" ] && bbr_ok=1
     fi
     if [ "$bbr_ok" -eq 0 ]; then
         log_err "包内未找到 CONFIG_TCP_CONG_BBRPLUS=y / tcp_bbrplus，拒绝安装"
