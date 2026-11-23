@@ -31,7 +31,9 @@ DNS_IPV4_LIST="76.76.2.0
 DNS_IPV6_LIST="2606:4700:4700::1111
 2001:4860:4860::8888"
 
-# 3. DoH (DNS over HTTPS) 上游地址 (Cloudflared 专用)
+# 3. DoH (DNS over HTTPS) 上游地址 (cloudflared 后端专用)
+#    FIX-RUNTIME-2: 新版 cloudflared 已移除 proxy-dns，会自动切换到 dnscrypt-proxy
+#    后端；dnscrypt-proxy 后端使用 cloudflare 上游（在线 resolver 列表），不使用此变量。
 DOH_URL_LIST="https://freedns.controld.com/p0
 https://8.8.8.8/dns-query"
 
@@ -123,8 +125,15 @@ FLAG_CSTATES="FLAG:cstates_disabled"
 FLAG_CLOUDFLARED="FLAG:cloudflared_installed"
 FLAG_SSHD_DROPIN="FLAG:sshd_dropin"
 FLAG_JOURNALD_ABSENT="FLAG:journald_conf_absent"
+# FIX-RUNTIME-2: DoH 提供者标记，卸载时据此判断是否需要移除 dnscrypt-proxy 配置/包
+FLAG_DNSCRYPT="FLAG:dnscrypt_installed"
 SVC_KEY_PREFIX="SVC:"        # svc_snapshot/svc_restore 内部构造键用
 KEY_GOVERNOR="GOVERNOR"
+
+# FIX-RUNTIME-2: DoH 后端。新版 cloudflared 已彻底移除 proxy-dns（子命令是空存根），
+# 自动改用 apt 源里的 dnscrypt-proxy（活跃维护、原生 DoH）。两个后端都生成
+# /etc/systemd/system/syspro-doh.service 并监听 DOH_LISTEN_ADDR:53，对上层透明。
+DOH_DNSCRYPT_CONF="/etc/syspro-dnscrypt.toml"
 
 # ==============================================================================
 #   nftx 协同配置 (Network Fast-Path)
@@ -2070,7 +2079,10 @@ optimize_net_floor() {
 # ==============================================================================
 
 install_cloudflared() {
-    log_info "开始部署 Cloudflared DoH 客户端 (容器稳定性增强版)..."
+    log_info "开始部署 DoH 本地加密 DNS 客户端..."
+    # FIX-RUNTIME-2: 后端选择器。cloudflared 新版已移除 proxy-dns，自动降级到
+    # dnscrypt-proxy；两者对外接口一致（syspro-doh.service 监听 DOH_LISTEN_ADDR:53）。
+    local doh_backend="cloudflared"
 
     # FIX-P1-7: AmbientCapabilities= 需要 systemd 229+。CentOS 7 是 systemd 219，
     # 该指令不识别会导致 unit 加载失败、DoH 部署整个退回 UDP。
@@ -2157,28 +2169,68 @@ SecureBits=keep-caps"
         return 1
     fi
 
-    # 新版 cloudflared 已把 proxy-dns 标记为废弃，个别版本直接移除。
-    # 先探测子命令是否存在，避免"装完起不来，还把 resolv.conf 改坏"。
+    # FIX-RUNTIME-2: 新版 cloudflared 已彻底移除 proxy-dns（proxy-dns 子命令是空存根，
+    # --help 即失败；全局 --proxy-dns 选项也被忽略）。此时自动切换到 dnscrypt-proxy：
+    # apt 源提供、活跃维护、原生 DoH，对外接口（unit 名/监听地址）保持一致。
     if ! /usr/local/bin/cloudflared proxy-dns --help >/dev/null 2>&1; then
-        log_err "当前 cloudflared 版本不支持 proxy-dns 子命令（官方已废弃该命令）"
-        log_warn "建议改用 dnscrypt-proxy，或手动安装支持 proxy-dns 的旧版本 cloudflared"
-        return 1
+        log_info "  - 当前 cloudflared 版本不支持 proxy-dns（官方已废弃），自动切换到 dnscrypt-proxy 后端"
+        doh_backend="dnscrypt"
+        if ! have dnscrypt-proxy; then
+            log_info "  - 正在安装 dnscrypt-proxy..."
+            smart_pkg_update
+            if ! pkg_install dnscrypt-proxy >/dev/null 2>&1 || ! have dnscrypt-proxy; then
+                log_err "dnscrypt-proxy 安装失败，DoH 部署中止（将回退 UDP）"
+                return 1
+            fi
+        fi
+        state_put "$FLAG_DNSCRYPT" "1"
+        # 生成独立 Toml：监听 DOH_LISTEN_ADDR:53，上游用 cloudflare（在线 resolver 列表），
+        # 不动系统自带的 dnscrypt-proxy.socket（127.0.2.1:53），避免端口冲突。
+        if ! cat > "$DOH_DNSCRYPT_CONF" << EOF
+# 由 SysPro 生成：本地 DoH 解析器
+listen_addresses = ['${DOH_LISTEN_ADDR}:53']
+server_names = ['cloudflare']
+[query_log]
+  file = '/var/log/syspro-dnscrypt-query.log'
+[nx_log]
+  file = '/var/log/syspro-dnscrypt-nx.log'
+[sources]
+  [sources.'public-resolvers']
+  url = 'https://download.dnscrypt.info/resolvers-list/v2/public-resolvers.md'
+  cache_file = '/var/cache/dnscrypt-proxy/public-resolvers.md'
+  minisign_key = 'RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3'
+  refresh_delay = 72
+  prefix = ''
+EOF
+        then
+            log_err "无法生成 dnscrypt-proxy 配置 $DOH_DNSCRYPT_CONF"
+            return 1
+        fi
+        chmod 644 "$DOH_DNSCRYPT_CONF" 2>/dev/null
+        log_success "  - dnscrypt-proxy 后端已就绪（上游: cloudflare DoH）"
     fi
 
     # --- 4. 生成 Systemd 服务 ---
+    # FIX-RUNTIME-2: 根据后端生成不同的 ExecStart / User，其余沙箱选项一致。
+    local doh_user="cloudflared" doh_exec="/usr/local/bin/cloudflared proxy-dns --port 53 --address ${DOH_LISTEN_ADDR} ${upstream_args} --bootstrap-dns 1.1.1.1"
+    if [ "$doh_backend" = "dnscrypt" ]; then
+        doh_user="root"
+        doh_exec="/usr/sbin/dnscrypt-proxy -config ${DOH_DNSCRYPT_CONF}"
+        [ -x /usr/sbin/dnscrypt-proxy ] || doh_exec="dnscrypt-proxy -config ${DOH_DNSCRYPT_CONF}"
+    fi
     if cat > /etc/systemd/system/syspro-doh.service << EOF
 [Unit]
-Description=SysPro DoH Client (Cloudflared)
+Description=SysPro DoH Client (${doh_backend})
 After=network.target network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=cloudflared
+User=${doh_user}
 # 只监听本地回环，避免变成公网开放递归解析器（会被用于 DNS 放大攻击）
 ${cap_lines}
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-ExecStart=/usr/local/bin/cloudflared proxy-dns --port 53 --address ${DOH_LISTEN_ADDR} ${upstream_args} --bootstrap-dns 1.1.1.1
+ExecStart=${doh_exec}
 Restart=always
 RestartSec=5
 NoNewPrivileges=yes
@@ -2238,10 +2290,24 @@ EOF
         return 1
     fi
 
-    # 端口开了不等于能解析，必须真的查一次
+    # 端口开了不等于能解析，必须真的查一次。
+    # FIX-RUNTIME-4: dnscrypt-proxy 端口几乎立即监听，但要下载 resolver 列表并连上
+    # 上游（通常 1-3 秒）后才 ready；cloudflared 则是启动即可用。原代码端口一开就
+    # 查一次，dnscrypt 后端会因尚未 ready 而误判失败、回退 UDP。改为重试到 ready。
     if have dig; then
-        if ! timeout 5 dig +short +time=3 +tries=1 @"$DOH_LISTEN_ADDR" cloudflare.com >/dev/null 2>&1; then
-            log_err "DoH 端口已监听，但实际域名解析失败"
+        local resolved=0 ri
+        for ((ri=1; ri<=20; ri++)); do
+            if timeout 3 dig +short +time=2 +tries=1 @"$DOH_LISTEN_ADDR" cloudflare.com >/dev/null 2>&1; then
+                resolved=1
+                break
+            fi
+            sleep 0.5
+        done
+        if [ "$resolved" -ne 1 ]; then
+            log_err "DoH 端口已监听，但 10 秒内实际域名解析始终失败"
+            if [ "$doh_backend" = "dnscrypt" ]; then
+                log_warn "  - dnscrypt-proxy 可能未能连通上游，请检查 download.dnscrypt.info 可达性"
+            fi
             return 1
         fi
     fi
@@ -4132,6 +4198,12 @@ cleanup_network() {
             else
                 log_info "  - DoH 服务已移除"
             fi
+        fi
+        # FIX-RUNTIME-2: 清理 dnscrypt-proxy 后端。只删本脚本生成的配置与标志；
+        # dnscrypt-proxy 包本身可能仍被系统其他服务使用，不擅自卸载。
+        if [ "$(state_get "$FLAG_DNSCRYPT" 2>/dev/null)" = "1" ]; then
+            rm -f "$DOH_DNSCRYPT_CONF" /var/log/syspro-dnscrypt-query.log /var/log/syspro-dnscrypt-nx.log
+            log_info "  - 已移除本脚本生成的 dnscrypt-proxy 配置（dnscrypt-proxy 包保留）"
         fi
         systemctl daemon-reload 2>/dev/null
     fi

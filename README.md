@@ -96,7 +96,7 @@ bash syspro.sh help
 ### [5] 接入与 DNS
 
 - **SSH 优化**：关闭 DNS 反查和 GSSAPI 认证，加快登录；重启前校验配置。
-- **DNS 模式**：标准 UDP 与 DoH（Cloudflared）双模，自动处理 systemd-resolved 冲突。
+- **DNS 模式**：标准 UDP 与 DoH 双模，自动处理 systemd-resolved 冲突。DoH 后端自动选择：新版 cloudflared 已移除 proxy-dns，脚本会自动切换到 dnscrypt-proxy（apt 源提供、活跃维护）；两者对外一致（syspro-doh.service 监听 127.0.0.1:53）。
 - **DNS 选优（v6.1）**：逐个实测 nameserver，只剔除实测不可达的项，IPv4 / IPv6 一视同仁；全不可达时保守不动，apply 前自动备份，原子重写配置文件。
 
 ### [6] 维护与清理
@@ -181,10 +181,10 @@ bash tests/offline_selftest.sh
 A：树莓派的 CPU 频率调节通常由固件控制，或缺少相应内核模块。脚本检测不可写时会跳过，不会报错。
 
 **Q2：开启 DoH 后 `/etc/resolv.conf` 指向 127.0.0.1 正常吗？**
-A：正常。DoH 模式下本地运行 Cloudflared 作为 DNS 代理。
+A：正常。DoH 模式下本地运行加密 DNS 代理，上游走 DoH（新版 cloudflared 已废弃 proxy-dns，脚本会自动切换到 dnscrypt-proxy，上游 cloudflare DoH）。
 
 **Q3：脚本卡在"安装 Cloudflared"？**
-A：国内服务器连接 GitHub Release 下载可能较慢，请配置代理或手动安装。
+A：新版会自动切换到 dnscrypt-proxy（通过 apt 安装，无需 GitHub）。若卡在 apt 下载，请检查软件源连通性；旧环境仍需从 GitHub 下载 cloudflared 时，可配置代理或手动安装。
 
 **Q4：可以在 Oracle ARM 机器上安装 BBR 吗？**
 A：不建议使用第三方 BBR 内核，Oracle ARM 默认内核已足够优秀，随意换内核可能导致引导失败。
