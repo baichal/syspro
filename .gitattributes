@@ -1,0 +1,4 @@
+# 强制 shell 脚本以 LF 行尾存储，避免 Windows 上 core.autocrlf=true 把
+# syspro.sh 变成 CRLF 后在 Linux 上执行报 "syntax error near unexpected token $'\r'"。
+*.sh text eol=lf
+*.md text eol=lf
