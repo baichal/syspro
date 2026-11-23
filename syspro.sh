@@ -4667,8 +4667,11 @@ cli_plan() {
     echo "    2. CPU 与熵池 (调度器参数, BBR 适配)"
     echo "    3. 进程与内存 (禁用 Auditd, 智能 ZRAM, 文件句柄)"
     echo "    4. 安全配置 (隐藏内核地址, dmesg 限制)"
-    echo "    5. 接入与 DNS (SSH, DoH/UDP 双模 + DNS 探测选优)"
+    # FIX-RUNTIME-5: 顺序与主菜单 case 0 保持一致——网络底座(a)在接入DNS(5)之前。
+    # 实际代码注释明确写了"先把容量与模块准备好，再动 DNS/SSH"，原 plan 顺序写反了，
+    # dry-run 预览与真实执行不符会误导用户判断。
     echo "    a. 网络底座 (模块预载/容量地板)"
+    echo "    5. 接入与 DNS (SSH, DoH/UDP 双模 + DNS 探测选优)"
     echo "    6. 维护与清理 (常用工具, 时区, 缓存清理)"
     echo "  卸载 (菜单 8) 将:"
     echo "    还原 state.env 快照中的内核参数、按备份恢复配置文件、"
