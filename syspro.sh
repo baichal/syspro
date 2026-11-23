@@ -116,6 +116,16 @@ MARK_ZRAM="/etc/syspro_zram_created"
 MARK_DOH="/etc/syspro_doh_installed"
 MARK_LOGS="/etc/syspro_logs_killed"
 
+# FIX-P3-7: 状态键名集中定义。写入(state_put)与读取(state_get/has)分散在不同函数，
+# 字符串字面量拼写不一致会导致回滚时读不到快照。统一用常量避免拼写漂移。
+FLAG_UDEV_RULES="FLAG:udev_rules"
+FLAG_CSTATES="FLAG:cstates_disabled"
+FLAG_CLOUDFLARED="FLAG:cloudflared_installed"
+FLAG_SSHD_DROPIN="FLAG:sshd_dropin"
+FLAG_JOURNALD_ABSENT="FLAG:journald_conf_absent"
+SVC_KEY_PREFIX="SVC:"        # svc_snapshot/svc_restore 内部构造键用
+KEY_GOVERNOR="GOVERNOR"
+
 # ==============================================================================
 #   nftx 协同配置 (Network Fast-Path)
 #   nftx_auto 的设计前提: 所有参数由"实测带宽 × RTT"动态推导，且刻意不落
@@ -156,6 +166,12 @@ DIR_PERMISSION=755            # 目录权限
 #   全局变量与基础检查
 # ==============================================================================
 
+# FIX-P3-1: 启用 pipefail，让 `cmd | grep` 这类管道的失败不再被 grep 的成功掩盖。
+# 注意: 脚本刻意不使用 set -e（大量命令失败是预期分支，靠显式判断处理），
+# 因此 pipefail 只修正"管道退出码"这一处语义，不会让任何命令失败导致意外退出。
+# 所有 `cmd | grep -q` 都在 if/&&/|| 中使用，本就依赖退出码，此处判断会更准确。
+set -o pipefail 2>/dev/null || true
+
 # 颜色定义 (用于输出美化)
 # 非交互环境（管道、重定向、CI）下关闭颜色，避免日志里塞满转义字符
 if [ -t 1 ]; then
@@ -175,8 +191,9 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # 放在最前面，因为这些副作用发生在 root 检查 / 锁 / setup_logrotate 之前或之中。
 SYSPRO_READONLY_CLI=0
 case "${1:-}" in
-    help|--help|-h|bbrplus-status|--bbrplus-status|bbrplus-check|--bbrplus-check|selftest|--selftest)
-        SYSPRO_READONLY_CLI=1 ;;
+    help|--help|-h|bbrplus-status|--bbrplus-status|bbrplus-check|--bbrplus-check|selftest|--selftest|plan|--plan|status-json|--status-json)
+        SYSPRO_READONLY_CLI=1 ;;   # FIX-P3-11/12: plan/status-json 也设为只读
+
     dns)
         # dns check 只读；dns apply 会写 resolv.conf，必须保留完整 root/锁/日志路径。
         [ "${2:-check}" != "apply" ] && SYSPRO_READONLY_CLI=1 ;;
@@ -344,7 +361,15 @@ backup_if_pristine() {
     if grep -q '由 SysPro 写入' "$src" 2>/dev/null; then
         return 1
     fi
-    cp -p "$src" "$bak" 2>/dev/null
+    if cp -p "$src" "$bak" 2>/dev/null; then
+        # FIX-P3-3: 写伴生标记，记录此备份由本脚本在某时刻建立。
+        # 恢复时据此区分"本脚本的原始备份"与"用户自己的同名文件"，
+        # 避免把用户文件当备份恢复。标记失败不影响备份本身。
+        printf 'src=%s\ntime=%s\n' "$src" "$(date '+%F %T' 2>/dev/null)" \
+            > "${bak}.syspro-origin" 2>/dev/null || true
+        return 0
+    fi
+    return 1
 }
 
 # 取"当前值"与"目标下限"中较大的那个，只读不动系统
@@ -1001,7 +1026,7 @@ optimize_disk_io() {
             printf 'ACTION=="add|change", KERNEL=="vd[a-z]*|sd[a-z]*", ENV{DEVTYPE}=="disk", ATTR{queue/read_ahead_kb}="256"\n'
         } > "$rules_new" 2>/dev/null; then
             chmod 644 "$rules_new"
-            state_put "FLAG:udev_rules" "$rules_new"
+            state_put "$FLAG_UDEV_RULES" "$rules_new"
             if udevadm control --reload && udevadm trigger --subsystem-match=block; then
                 log_success "I/O 调度器规则已更新 (fast=${sched_fast:-不可用}, disk=${sched_disk:-不可用})。"
             else
@@ -1107,7 +1132,7 @@ optimize_compute() {
     if [ "${CPU_GOVERNOR_MODE:-1}" = "1" ]; then
         local g0
         g0=$(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null)
-        [ -n "$g0" ] && state_put "GOVERNOR" "$g0"
+        [ -n "$g0" ] && state_put "$KEY_GOVERNOR" "$g0"
 
         log_info "正在锁定 CPU 频率为 Performance 模式..."
 
@@ -1142,7 +1167,7 @@ optimize_compute() {
     if [ "${CPU_DISABLE_DEEP_CSTATES:-0}" = "1" ]; then
         if command -v cpupower >/dev/null 2>&1; then
             if cpupower idle-set -D 2 >/dev/null 2>&1; then
-                state_put "FLAG:cstates_disabled" "1"
+                state_put "$FLAG_CSTATES" "1"
                 log_success "已禁用 C1 以上深度 C-State（延迟优先）。"
                 log_warn "注意: 空闲功耗与温度会明显上升，且需重启才能完全恢复。"
             else
@@ -2094,7 +2119,7 @@ SecureBits=keep-caps"
            && /usr/local/bin/cloudflared --version >/dev/null 2>&1; then
             # 记下"这个二进制是本脚本放的"，卸载时才有资格删。
             # 旧版本只要 syspro-doh.service 在就删，连用户自己装的也一起删了。
-            state_put "FLAG:cloudflared_installed" "1"
+            state_put "$FLAG_CLOUDFLARED" "1"
             log_success "Cloudflared 已下载并校验可执行。"
         else
             log_err "下载失败或文件不可执行，请检查网络与架构。"
@@ -2298,7 +2323,7 @@ optimize_ssh() {
         if [ "$eff" != "no" ] && [ -n "$include_dir" ] && [ -d "$include_dir" ]; then
             if printf '# 由 SysPro 写入: 覆盖 Include drop-in 里的同名设置（sshd 先读到的生效）\nUseDNS no\nGSSAPIAuthentication no\n' \
                     > "${include_dir}/00-syspro.conf" 2>/dev/null; then
-                state_put "FLAG:sshd_dropin" "${include_dir}/00-syspro.conf"
+                state_put "$FLAG_SSHD_DROPIN" "${include_dir}/00-syspro.conf"
                 log_info "  - drop-in 覆盖了 UseDNS，已写入 ${include_dir}/00-syspro.conf"
                 eff=$("$sshd_bin" -T 2>/dev/null | awk 'tolower($1)=="usedns" {print tolower($2); exit}')
             fi
@@ -2418,18 +2443,49 @@ dns_select_best() {
 
     tries=${DNS_PROBE_TRIES:-3}
     log_info "DNS 选优探测（协议族无关，基于实测）  域名: ${doms[*]}  每服务器 ${tries} 次"
-    for s in "${servers[@]}"; do
-        okcnt=0; sum=0
-        for ((i = 0; i < tries; i++)); do
-            dom=${doms[i % ${#doms[@]}]}
-            res=$(dns_probe_one "$s" "$dom") || res=''
-            case "$res" in
-                ok*)
-                    read -r st ms <<< "$res"
-                    case "$ms" in ''|*[!0-9]*) ms=0 ;; esac
-                    okcnt=$((okcnt + 1)); sum=$((sum + ms)) ;;
-            esac
+    # FIX-P3-13: 各 server 之间并行探测（server 内部仍串行 tries 次），
+    # 结果按索引写入临时文件保证聚合顺序与串行版一致。mktemp 失败时回退串行。
+    local probe_dir="" pi
+    probe_dir=$(mktemp -d /tmp/syspro-dns-probe.XXXXXX 2>/dev/null) || probe_dir=""
+    if [ -n "$probe_dir" ]; then
+        for ((pi = 0; pi < ${#servers[@]}; pi++)); do
+            (
+                local _s="${servers[pi]}" _i _dom _res _st _ms _ok=0 _sum=0
+                for ((_i = 0; _i < tries; _i++)); do
+                    _dom=${doms[_i % ${#doms[@]}]}
+                    _res=$(dns_probe_one "$_s" "$_dom") || _res=''
+                    case "$_res" in
+                        ok*)
+                            read -r _st _ms <<< "$_res"
+                            case "$_ms" in ''|*[!0-9]*) _ms=0 ;; esac
+                            _ok=$((_ok + 1)); _sum=$((_sum + _ms)) ;;
+                    esac
+                done
+                printf '%s %s\n' "$_ok" "$_sum" > "${probe_dir}/${pi}.result" 2>/dev/null
+            ) &
         done
+        wait
+    fi
+    for ((pi = 0; pi < ${#servers[@]}; pi++)); do
+        s="${servers[pi]}"
+        okcnt=0; sum=0
+        if [ -n "$probe_dir" ] && [ -f "${probe_dir}/${pi}.result" ]; then
+            read -r okcnt sum < "${probe_dir}/${pi}.result" 2>/dev/null
+            case "$okcnt" in ''|*[!0-9]*) okcnt=0 ;; esac
+            case "$sum" in ''|*[!0-9]*) sum=0 ;; esac
+        else
+            # 回退：并行结果缺失时串行重探该 server
+            for ((i = 0; i < tries; i++)); do
+                dom=${doms[i % ${#doms[@]}]}
+                res=$(dns_probe_one "$s" "$dom") || res=''
+                case "$res" in
+                    ok*)
+                        read -r st ms <<< "$res"
+                        case "$ms" in ''|*[!0-9]*) ms=0 ;; esac
+                        okcnt=$((okcnt + 1)); sum=$((sum + ms)) ;;
+                esac
+            done
+        fi
         if [ "$okcnt" -ge 1 ]; then
             good+=("$s")
             log_info "  - $s 可达 $okcnt/$tries，平均 $((sum / okcnt))ms -> 保留"
@@ -2438,6 +2494,7 @@ dns_select_best() {
             log_warn "  - $s 不可达 0/$tries -> 剔除"
         fi
     done
+    [ -n "$probe_dir" ] && rm -rf "$probe_dir" 2>/dev/null
 
     if [ ${#good[@]} -eq 0 ]; then
         log_warn "所有 nameserver 都不可达：保守起见不修改 $rc_file（避免彻底断网）"
@@ -2567,6 +2624,62 @@ lock_resolv_if_requested() {
     return 0
 }
 
+# FIX-P3-5: 从 configure_dns 拆出——按配置探测并构建标准 DNS 候选清单。
+# 参数: $1 = 输出文件路径（函数会先清空该文件）
+build_dns_candidates() {
+    local outf="$1"
+    local v4_added=0 v6_added=0 ip rc
+
+    echo "# SysPro Standard DNS" > "$outf"
+
+    log_info "正在测试 IPv4 DNS 服务器连通性..."
+    while read -r ip; do
+        [[ -z "$ip" || "$ip" =~ ^# ]] && continue
+        validate_ipv4 "$ip" || { log_warn "  - $ip 格式非法，已跳过"; continue; }
+        test_dns_server "$ip" 2; rc=$?
+        case $rc in
+            0) echo "nameserver $ip" >> "$outf"
+               v4_added=$((v4_added + 1))
+               log_success "  - $ip 可用，已加入" ;;
+            1) log_warn "  - $ip 不可达，已跳过" ;;
+            *) log_warn "  - $ip 无法判断（未安装 dig），按保守策略跳过" ;;
+        esac
+    done <<< "$DNS_IPV4_LIST"
+
+    # 兜底：避免 resolv.conf 被写空
+    if [ "$v4_added" -eq 0 ]; then
+        log_warn "未发现验证通过的 IPv4 DNS，按配置原样写入"
+        while read -r ip; do
+            [[ -z "$ip" || "$ip" =~ ^# ]] && continue
+            validate_ipv4 "$ip" && echo "nameserver $ip" >> "$outf"
+        done <<< "$DNS_IPV4_LIST"
+    fi
+
+    # IPv6 DNS 只在"有默认路由且有全局地址"时才尝试。
+    # 注意: 探测失败只跳过这一条 DNS，绝不再去动内核的 disable_ipv6 开关
+    #       （v5.3 就是在这里把整机 IPv6 关掉的）。
+    if has_global_ipv6; then
+        log_info "正在测试 IPv6 DNS 服务器连通性..."
+        while read -r ip; do
+            [[ -z "$ip" || "$ip" =~ ^# ]] && continue
+            validate_ipv6 "$ip" || { log_warn "  - $ip 格式非法，已跳过"; continue; }
+            test_dns_server "$ip" 2; rc=$?
+            if [ "$rc" -eq 0 ]; then
+                echo "nameserver $ip" >> "$outf"
+                v6_added=$((v6_added + 1))
+                log_success "  - $ip (IPv6) 可用，已加入"
+            else
+                log_warn "  - $ip (IPv6) 未通过本次测试，已跳过（不改动内核 IPv6）"
+            fi
+        done <<< "$DNS_IPV6_LIST"
+    else
+        log_info "未检测到 IPv6 默认路由，跳过 IPv6 DNS 配置"
+    fi
+
+    echo "options timeout:$DNS_TIMEOUT attempts:$DNS_ATTEMPTS rotate" >> "$outf"
+    return 0
+}
+
 configure_dns() {
     log_info "正在配置 DNS..."
 
@@ -2586,11 +2699,15 @@ configure_dns() {
     # 首次修改前备份原始 resolv.conf（可能是指向 stub-resolv.conf 的符号链接），
     # 卸载时按原样恢复，而不是粗暴地写死 8.8.8.8。
     if [ ! -e /etc/resolv.conf.syspro.bak ] && [ ! -L /etc/resolv.conf.syspro.bak ]; then
+        local _bak_ok=0
         if [ -L /etc/resolv.conf ]; then
-            cp -P /etc/resolv.conf /etc/resolv.conf.syspro.bak 2>/dev/null
+            cp -P /etc/resolv.conf /etc/resolv.conf.syspro.bak 2>/dev/null && _bak_ok=1
         elif [ -f /etc/resolv.conf ]; then
-            cp -p /etc/resolv.conf /etc/resolv.conf.syspro.bak 2>/dev/null
+            cp -p /etc/resolv.conf /etc/resolv.conf.syspro.bak 2>/dev/null && _bak_ok=1
         fi
+        # FIX-P3-3: 伴生标记，供恢复/卸载时确认备份来源
+        [ "$_bak_ok" -eq 1 ] && printf 'src=/etc/resolv.conf\ntime=%s\n' "$(date '+%F %T' 2>/dev/null)" \
+            > /etc/resolv.conf.syspro.bak.syspro-origin 2>/dev/null || true
     fi
 
     chattr -i /etc/resolv.conf >/dev/null 2>&1
@@ -2654,56 +2771,8 @@ EOF
 
     if [[ "$DNS_CHOICE" != "2" ]]; then
         local new_dns="/etc/resolv.conf.syspro.new"
-        local v4_added=0 v6_added=0 ip rc
-
-        echo "# SysPro Standard DNS" > "$new_dns"
-
-        log_info "正在测试 IPv4 DNS 服务器连通性..."
-        while read -r ip; do
-            [[ -z "$ip" || "$ip" =~ ^# ]] && continue
-            validate_ipv4 "$ip" || { log_warn "  - $ip 格式非法，已跳过"; continue; }
-            test_dns_server "$ip" 2; rc=$?
-            case $rc in
-                0) echo "nameserver $ip" >> "$new_dns"
-                   v4_added=$((v4_added + 1))
-                   log_success "  - $ip 可用，已加入" ;;
-                1) log_warn "  - $ip 不可达，已跳过" ;;
-                *) log_warn "  - $ip 无法判断（未安装 dig），按保守策略跳过" ;;
-            esac
-        done <<< "$DNS_IPV4_LIST"
-
-        # 兜底：避免 resolv.conf 被写空
-        if [ "$v4_added" -eq 0 ]; then
-            log_warn "未发现验证通过的 IPv4 DNS，按配置原样写入"
-            while read -r ip; do
-                [[ -z "$ip" || "$ip" =~ ^# ]] && continue
-                validate_ipv4 "$ip" && echo "nameserver $ip" >> "$new_dns"
-            done <<< "$DNS_IPV4_LIST"
-        fi
-
-        # IPv6 DNS 只在"有默认路由且有全局地址"时才尝试。
-        # 注意: 探测失败只跳过这一条 DNS，绝不再去动内核的 disable_ipv6 开关
-        #       （v5.3 就是在这里把整机 IPv6 关掉的）。
-        # FIX-P1-12: 统一走 has_global_ipv6，与 gai 层口径一致
-        if has_global_ipv6; then
-            log_info "正在测试 IPv6 DNS 服务器连通性..."
-            while read -r ip; do
-                [[ -z "$ip" || "$ip" =~ ^# ]] && continue
-                validate_ipv6 "$ip" || { log_warn "  - $ip 格式非法，已跳过"; continue; }
-                test_dns_server "$ip" 2; rc=$?
-                if [ "$rc" -eq 0 ]; then
-                    echo "nameserver $ip" >> "$new_dns"
-                    v6_added=$((v6_added + 1))
-                    log_success "  - $ip (IPv6) 可用，已加入"
-                else
-                    log_warn "  - $ip (IPv6) 未通过本次测试，已跳过（不改动内核 IPv6）"
-                fi
-            done <<< "$DNS_IPV6_LIST"
-        else
-            log_info "未检测到 IPv6 默认路由，跳过 IPv6 DNS 配置"
-        fi
-
-        echo "options timeout:$DNS_TIMEOUT attempts:$DNS_ATTEMPTS rotate" >> "$new_dns"
+        # FIX-P3-5: 候选清单构建抽成独立函数，主函数只负责选择/提交
+        build_dns_candidates "$new_dns"
 
         # v6.1: 写盘前自动做一次探测选优（菜单 5 / 一键优化都走这里）。
         # backup=0: 原始 resolv.conf 在本函数开头已备份，这里只是候选清单，
@@ -2716,19 +2785,9 @@ EOF
             esac
         fi
 
-        mv -f "$new_dns" /etc/resolv.conf
-
-        if verify_resolv; then
-            lock_resolv_if_requested
-            log_success "标准 DNS 模式已生效（解析已验证）。"
-        else
-            # FIX-P0-1: 验证失败必须自动回滚，否则一组不可达 DNS 会被永久留下，
-            # 远程机器在 DNS 失效时等于失联。此前只打日志让用户手动恢复，违背可回滚承诺。
-            log_err "DNS 写入后解析验证失败，正在自动回滚。"
-            rollback_resolv_conf || \
-                log_warn "回滚未完成，请手动恢复: cp -p /etc/resolv.conf.syspro.bak /etc/resolv.conf"
-            return 1
-        fi
+        # FIX-P3-2: 统一走原子提交原语（内部含 P0-1 的失败自动回滚）
+        commit_config_atomic "$new_dns" /etc/resolv.conf /etc/resolv.conf.syspro.bak \
+            "标准 DNS 模式已生效（解析已验证）。" "DNS" || return 1
     fi
 }
 
@@ -2741,6 +2800,7 @@ rollback_resolv_conf() {
     chattr -i /etc/resolv.conf >/dev/null 2>&1
     if [ -e "$bak" ] || [ -L "$bak" ]; then
         if mv -f "$bak" /etc/resolv.conf 2>/dev/null; then
+            rm -f "${bak}.syspro-origin"   # FIX-P3-3: 清理伴生标记
             log_warn "  - 解析验证失败，已自动回滚 /etc/resolv.conf 到原始配置"
             return 0
         fi
@@ -2748,6 +2808,35 @@ rollback_resolv_conf() {
         return 1
     fi
     log_err "  - 找不到原始备份 ${bak}，无法自动回滚；请手动恢复 DNS"
+    return 1
+}
+
+# FIX-P3-2: 通用"原子提交配置"原语：备份已存在 -> 原子写入 -> 验证 -> 失败回滚。
+# 把散落在各处的"mv + verify + rollback"收敛为一处，避免每个调用点各写一遍
+# 回滚逻辑（P0-1 正是这类重复导致遗漏）。当前用于标准 DNS 写入；
+# DoH 分支因额外涉及服务停止/nsswitch 恢复，保留其专用逻辑。
+# 参数: $1=候选新文件 $2=目标文件 $3=备份文件 $4=成功提示 $5=失败上下文描述
+# 依赖调用方已建立 $3 备份；返回 0=成功 1=验证失败已回滚
+commit_config_atomic() {
+    local newf="$1" target="$2" bak="$3" okmsg="$4" ctx="$5"
+    mv -f "$newf" "$target" 2>/dev/null || {
+        log_err "写入 ${ctx} 失败"
+        return 1
+    }
+    if verify_resolv; then
+        lock_resolv_if_requested
+        log_success "$okmsg"
+        return 0
+    fi
+    log_err "${ctx}写入后解析验证失败，正在自动回滚。"
+    if [ -e "$bak" ] || [ -L "$bak" ]; then
+        mv -f "$bak" "$target" 2>/dev/null && {
+            rm -f "${bak}.syspro-origin" 2>/dev/null
+            log_warn "  - 已自动回滚 ${ctx} 到原始配置"
+            return 1
+        }
+    fi
+    log_warn "  - 回滚未完成，请手动恢复: cp -p ${bak} ${target}"
     return 1
 }
 
@@ -3175,6 +3264,27 @@ bbrplus_rollback_get() {
     awk -F= -v key="$k" '$1==key { sub(/^[^=]*=/, ""); print; exit }' "$f" 2>/dev/null
 }
 
+# FIX-P3-4: 显式阶段状态机。rollback_put 是"只写一次"（保护原值快照），
+# 阶段状态需要能覆盖更新，故单独提供 setter。
+# 阶段: installed（已装待重启确认）→ confirmed（已设持久默认）→ rolled-back（已回退）
+bbrplus_stage_set() {
+    local stage=$1 f="$BBRPLUS_BACKUP_DIR/rollback.env"
+    mkdir -p "$BBRPLUS_BACKUP_DIR" 2>/dev/null || return 1
+    [ -f "$f" ] || : > "$f" 2>/dev/null || return 1
+    if grep -q '^STAGE=' "$f" 2>/dev/null; then
+        sed -i "s|^STAGE=.*|STAGE=${stage}|" "$f" 2>/dev/null
+    else
+        printf 'STAGE=%s\n' "$stage" >> "$f" 2>/dev/null
+    fi
+}
+bbrplus_stage_get() {
+    # 旧版本rollback.env无 STAGE 字段，awk 无匹配仍返回 0，不能靠 || 兜底，
+    # 必须对输出判空（显示为 unknown 而非空白）。
+    local st
+    st=$(bbrplus_rollback_get "STAGE" 2>/dev/null)
+    [ -n "$st" ] && printf '%s' "$st" || printf 'unknown'
+}
+
 bbrplus_pkg_installed() {
     [ "$RELEASE_FAMILY" = "apt" ] || return 1
     dpkg-query -W -f='${Status}' "linux-image-$BBRPLUS_KVER" 2>/dev/null \
@@ -3262,6 +3372,7 @@ bbrplus_status() {
     printf '%-20s %s\n' 'GRUB_DEFAULT' "${dflt:-未设置}"
     printf '%-20s %s\n' 'grubenv' "${saved:-空}"
     printf '%-20s %s\n' '回退内核' "${fb:-未记录}"
+    printf '%-20s %s\n' '阶段' "$(bbrplus_stage_get)"   # FIX-P3-4
     printf '%-20s %s\n' '回滚信息' "$BBRPLUS_BACKUP_DIR/rollback.env"
     return 0
 }
@@ -3428,6 +3539,7 @@ bbrplus_install_pkgs() {
         [ -f "$f" ] && cp -p "$f" "$BBRPLUS_BACKUP_DIR/$(basename "$f")" 2>/dev/null
     done
     bbrplus_rollback_put "GRUB_DEFAULT" "$dflt"
+    bbrplus_stage_set "installed"   # FIX-P3-4: 阶段 = 已安装待确认
     bbrplus_rollback_put "SAVED_ENTRY" "$saved"
     bbrplus_rollback_put "FALLBACK_KERNEL" "$fb"
     bbrplus_rollback_put "RUNNING_KERNEL_BEFORE" "$cur"
@@ -3524,6 +3636,7 @@ bbrplus_confirm() {
     fb=$(bbrplus_find_fallback 2>/dev/null)
     [ -n "$fb" ] && bbrplus_rollback_put "FALLBACK_KERNEL" "$fb"
     bbrplus_rollback_put "CONFIRMED" "$(date '+%F %T')"
+    bbrplus_stage_set "confirmed"   # FIX-P3-4: 阶段 = 已确认持久默认
     log_success "已把 bbrplus 设为持久默认（GRUB_DEFAULT=saved）"
     log_info "回退: $0 bbrplus-rollback  或  grub-set-default ${dflt} && reboot"
     return 0
@@ -3567,6 +3680,7 @@ bbrplus_rollback() {
         log_err "GRUB 配置可能处于半更新状态，请检查后重试 bbrplus-rollback"
         return 1
     fi
+    bbrplus_stage_set "rolled-back"   # FIX-P3-4: 阶段 = 已回退
     log_success "已恢复 GRUB_DEFAULT=${dflt}，并清除一次性启动项"
     log_info "回退目标: ${fb_target:-${saved:-菜单第 1 项}}（${fb:-原内核}）"
     log_info "bbrplus 内核包仍保留，可再用 bbrplus-confirm 切回"
@@ -3810,7 +3924,7 @@ optimize_logging_killer() {
         # 原机器上根本没有 journald.conf（容器 / 极简镜像很常见），
         # 或者它已经是本脚本写的。记下来: 卸载时应该删掉这个文件，
         # 而不是"恢复"一份我们自己的 Storage=none 配置。
-        state_put "FLAG:journald_conf_absent" "1"
+        state_put "$FLAG_JOURNALD_ABSENT" "1"
     fi
     cat > /etc/systemd/journald.conf << EOF
 [Journal]
@@ -3903,11 +4017,16 @@ restore_from_backup() {
     local desc="$3"
     
     if [ -f "$backup_file" ]; then
+        # FIX-P3-3: 若存在伴生标记，读取备份来源时间用于日志；无标记则是旧版备份，
+        # 仍按原样恢复（向后兼容）。恢复后一并清掉标记。
+        local origin=""
+        [ -f "${backup_file}.syspro-origin" ] && \
+            origin=$(awk -F= '/^time=/{print $2; exit}' "${backup_file}.syspro-origin" 2>/dev/null)
         # -p: 保留权限/属主。fstab、system.conf 这类文件一旦变成 644 之外的模式，
         # systemd 和 mount 都会报权限错误，而这正是"恢复"最不该引入的副作用。
         if cp -p "$backup_file" "$target_file" 2>/dev/null; then
-            rm -f "$backup_file"
-            log_info "已恢复${desc}"
+            rm -f "$backup_file" "${backup_file}.syspro-origin"
+            [ -n "$origin" ] && log_info "已恢复${desc}（原始备份: ${origin}）" || log_info "已恢复${desc}"
             return 0
         else
             log_err "恢复${desc}失败"
@@ -3947,7 +4066,7 @@ restore_logging() {
     if [ -f /etc/systemd/journald.conf.syspro.bak ]; then
         restore_from_backup "/etc/systemd/journald.conf.syspro.bak" \
                             "/etc/systemd/journald.conf" "journald 配置"
-    elif [ "$(state_get 'FLAG:journald_conf_absent' 2>/dev/null)" = "1" ]; then
+    elif [ "$(state_get "$FLAG_JOURNALD_ABSENT" 2>/dev/null)" = "1" ]; then
         # 原本就没有这个文件（或只剩我们自己写的），删掉才是真正的还原
         rm -f /etc/systemd/journald.conf
         log_info "  - 原系统本无 journald.conf，已删除本脚本创建的副本"
@@ -3989,7 +4108,7 @@ cleanup_network() {
         # 只有确认"这个二进制是本脚本下载的"才删。
         # 旧版本的注释写着"可以确定由本脚本放置"，但 install_cloudflared 里
         # 明确有"复用已存在二进制"的分支 —— 那句话是错的，会删掉用户自己装的。
-        if [ "$(state_get 'FLAG:cloudflared_installed' 2>/dev/null)" = "1" ]; then
+        if [ "$(state_get "$FLAG_CLOUDFLARED" 2>/dev/null)" = "1" ]; then
             rm -f /usr/local/bin/cloudflared
             log_info "  - DoH 服务与本脚本安装的 cloudflared 已移除"
         else
@@ -4026,7 +4145,7 @@ cleanup_network() {
     # 恢复 SSH 配置
     # drop-in 是后加的，必须先删，否则 sshd 仍会读到 UseDNS no
     local sshd_dropin
-    sshd_dropin=$(state_get "FLAG:sshd_dropin" 2>/dev/null)
+    sshd_dropin=$(state_get "$FLAG_SSHD_DROPIN" 2>/dev/null)
     if [ -n "$sshd_dropin" ] && [ -f "$sshd_dropin" ]; then
         rm -f "$sshd_dropin"
         log_info "  - 已移除 ${sshd_dropin##*/}"
@@ -4084,6 +4203,7 @@ restore_dns() {
                 # 用 mv -f 直接覆盖，不要先 rm: 万一是跨设备/权限问题导致 mv 失败，
                 # 先 rm 会让机器连一个 resolv.conf 都不剩。
                 if mv -f /etc/resolv.conf.syspro.bak /etc/resolv.conf; then
+                    rm -f /etc/resolv.conf.syspro.bak.syspro-origin   # FIX-P3-3: 清理伴生标记
                     log_info "  - /etc/resolv.conf 已按原始备份恢复"
                     restored=1
                 else
@@ -4290,7 +4410,7 @@ cleanup_optimizations() {
 
     # CPU 频率策略回滚
     local gov
-    if gov=$(state_get "GOVERNOR" 2>/dev/null) && [ -n "$gov" ]; then
+    if gov=$(state_get "$KEY_GOVERNOR" 2>/dev/null) && [ -n "$gov" ]; then
         local cg gov_n=0
         for cg in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
             if [ -w "$cg" ] && echo "$gov" > "$cg" 2>/dev/null; then
@@ -4299,7 +4419,7 @@ cleanup_optimizations() {
         done
         [ "$gov_n" -gt 0 ] && log_info "  - CPU governor 已恢复为 $gov（$gov_n 个核心）"
     fi
-    if [ "$(state_get 'FLAG:cstates_disabled' 2>/dev/null)" = "1" ] && have cpupower; then
+    if [ "$(state_get "$FLAG_CSTATES" 2>/dev/null)" = "1" ] && have cpupower; then
         if cpupower idle-set -E >/dev/null 2>&1; then
             log_info "  - 深度 C-State 已重新启用"
         else
@@ -4451,6 +4571,38 @@ show_menu() {
 }
 
 
+# FIX-P3-11: dry-run 预览（plan）——只读列出"一键优化 0"将执行的所有模块，
+# 不执行任何写操作。给用户一个零风险的"看清楚再动手"入口。
+cli_plan() {
+    echo "SysPro 执行计划（dry-run，只读预览，不会修改系统）"
+    echo "  0 一键优化将按顺序执行:"
+    echo "    1. I/O 优化 (Noatime, Udev 调度)"
+    echo "    2. CPU 与熵池 (调度器参数, BBR 适配)"
+    echo "    3. 进程与内存 (禁用 Auditd, 智能 ZRAM, 文件句柄)"
+    echo "    4. 安全配置 (隐藏内核地址, dmesg 限制)"
+    echo "    5. 接入与 DNS (SSH, DoH/UDP 双模 + DNS 探测选优)"
+    echo "    a. 网络底座 (模块预载/容量地板)"
+    echo "    6. 维护与清理 (常用工具, 时区, 缓存清理)"
+    echo "  卸载 (菜单 8) 将:"
+    echo "    还原 state.env 快照中的内核参数、按备份恢复配置文件、"
+    echo "    移除本脚本创建的 ZRAM/Swap/DoH 与标记文件"
+    echo "  提示: 以上模块会改动系统配置，请在理解后于交互菜单中执行。"
+    return 0
+}
+
+# FIX-P3-12: 巡检用 JSON 状态输出（只读，不改日志函数、不影响现有 CLI）
+cli_status_json() {
+    local cur cc stage fb pkg="false"
+    cur=$(uname -r 2>/dev/null)
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+    stage=$(bbrplus_stage_get 2>/dev/null)
+    fb=$(bbrplus_rollback_get "FALLBACK_KERNEL" 2>/dev/null)
+    bbrplus_pkg_installed && pkg="true"
+    printf '{"kernel":"%s","cc":"%s","bbrplus_pkg":%s,"stage":"%s","fallback_kernel":"%s"}\n' \
+        "$cur" "$cc" "$pkg" "$stage" "${fb:-}"
+    return 0
+}
+
 # ==============================================================================
 #   非交互 CLI（自动化 / 巡检 / 测试用，优先级高于交互菜单）
 #   除 install / confirm / rollback 外都是只读，不改系统配置。
@@ -4470,6 +4622,8 @@ SysPro v6.1
     dns [check|apply] [文件]        逐个实测 nameserver；apply 只剔除实测不可达的
                                    （默认 check，文件默认 /etc/resolv.conf）
     selftest                       只读自检（函数完整性 / 语法 / 环境）
+    plan                           dry-run 预览：列出一键优化将执行的模块（不改系统）
+    status-json                    巡检用 JSON 格式状态输出（只读）
 EOF
         exit 0 ;;
     bbrplus-status|--bbrplus-status) bbrplus_status; exit $? ;;
@@ -4500,6 +4654,8 @@ EOF
         [ "$_dnssub" = "apply" ] && [ "$_dnsrc" -eq 0 ] && lock_resolv_if_requested "$_dnsfile"
         exit "$_dnsrc" ;;
     selftest|--selftest) syspro_selftest; exit $? ;;
+    plan|--plan) cli_plan; exit $? ;;                    # FIX-P3-11
+    status-json|--status-json) cli_status_json; exit $? ;;  # FIX-P3-12
 esac
 
 # 非交互环境（curl | bash、CI、无终端）下 read 会立即返回，菜单会无限空转。
